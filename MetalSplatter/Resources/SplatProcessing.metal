@@ -219,3 +219,118 @@ half splatFragmentAlpha(half2 relativePosition, half splatAlpha) {
     half negativeMagnitudeSquared = -dot(relativePosition, relativePosition);
     return (negativeMagnitudeSquared < -kBoundsRadiusSquared) ? 0 : exp(0.5 * negativeMagnitudeSquared) * splatAlpha;
 }
+
+// MARK: - Relighting (split-sum IBL)
+
+half3 shadePBR(half3 baseColorLinear,
+               SplatMaterial material,
+               float3 worldPosition,
+               float3 cameraPosition,
+               constant RelightUniforms &relight,
+               texturecube<float> prefilteredEnv,
+               texturecube<float> irradianceEnv,
+               texture2d<float> brdfLUT,
+               sampler iblSampler) {
+    // The splat's existing (SH-evaluated, linear) color is used as the diffuse albedo, so the
+    // diffuse term relights with the environment too. This works for standard 3DGS (where it is the
+    // only available color) as well as for Ref-Gaussian scenes.
+    float3 albedo = float3(baseColorLinear);
+
+    float3 N = normalize(float3(material.normal));
+    float3 V = normalize(cameraPosition - worldPosition);
+    // Two-sided: orient the normal toward the camera (Ref-Gaussian uses a view-dependent flip).
+    if (dot(N, V) < 0.0f) {
+        N = -N;
+    }
+    float3 R = reflect(-V, N);
+
+    // Rotate the sample directions by the environment orientation.
+    float3 sampleR = (relight.envRotation * float4(R, 0.0f)).xyz;
+    float3 sampleN = (relight.envRotation * float4(N, 0.0f)).xyz;
+
+    float roughness = relight.roughnessOverride >= 0.0f ? relight.roughnessOverride : float(material.roughness);
+    float reflectionStrength = relight.reflectionStrengthOverride >= 0.0f ? relight.reflectionStrengthOverride : float(material.reflectionStrength);
+    roughness = clamp(roughness, 0.0f, 1.0f);
+
+    float NdotV = saturate(dot(N, V));
+    float mipLevel = roughness * float(max(1u, relight.prefilteredMipCount) - 1u);
+
+    float3 prefiltered = prefilteredEnv.sample(iblSampler, sampleR, level(mipLevel)).rgb * relight.envIntensity;
+    float3 irradiance = irradianceEnv.sample(iblSampler, sampleN, level(0)).rgb * relight.envIntensity;
+    float2 fg = brdfLUT.sample(iblSampler, float2(NdotV, roughness), level(0)).rg;
+
+    float3 specularTint = float3(material.specularTint);
+    float3 F0 = mix(float3(0.04f), specularTint, reflectionStrength);
+    float3 specular = prefiltered * (F0 * fg.x + fg.y);
+
+    // Ref-Gaussian render_surfel uses the SH base color as the diffuse term DIRECTLY (no diffuse
+    // IBL relight): final = (1 - refl) * base_color + specular. (irradiance kept for debug mode 5.)
+    float3 finalColor = (1.0f - reflectionStrength) * albedo + specular;
+
+    switch (relight.debugMode) {
+        case 1: finalColor = N * 0.5f + 0.5f; break;          // world-space normal
+        case 2: finalColor = float3(roughness); break;        // roughness
+        case 3: finalColor = float3(reflectionStrength); break; // reflection strength
+        case 4: finalColor = prefiltered; break;              // sampled prefiltered environment
+        case 5: finalColor = irradiance; break;               // sampled diffuse irradiance
+        case 6: finalColor = specularTint; break;             // ori_color (albedo)
+        default: break;
+    }
+
+    return half3(finalColor);
+}
+
+// MARK: - Deferred relighting (per-pixel split-sum IBL)
+
+half3 shadeIBLDeferred(half3 baseColorLinear,
+                       half3 oriColorLinear,
+                       float3 N,
+                       float3 V,
+                       float roughness,
+                       float reflectionStrength,
+                       constant RelightUniforms &relight,
+                       texturecube<float> prefilteredEnv,
+                       texturecube<float> irradianceEnv,
+                       texture2d<float> brdfLUT,
+                       sampler iblSampler) {
+    // Matches Ref-Gaussian render_surfel / get_specular_color_surfel exactly:
+    //   F0       = 0.04 * (1 - refl) + ori_color * refl
+    //   specular = prefilteredEnv(reflect(V,N), roughness) * (F0 * fg.x + fg.y)
+    //   final    = (1 - refl) * base_color + specular
+    // base_color is the SH-evaluated diffuse color used DIRECTLY (no diffuse IBL relight);
+    // ori_color is the learned albedo that tints the specular F0 (NOT the SH color).
+    float3 baseColor = float3(baseColorLinear);
+    float3 oriColor = float3(oriColorLinear);
+
+    // N and V arrive already normalized from the blended G-buffer.
+    float3 R = reflect(-V, N);
+    float3 sampleR = (relight.envRotation * float4(R, 0.0f)).xyz;
+    float3 sampleN = (relight.envRotation * float4(N, 0.0f)).xyz;
+
+    roughness = relight.roughnessOverride >= 0.0f ? relight.roughnessOverride : roughness;
+    reflectionStrength = relight.reflectionStrengthOverride >= 0.0f ? relight.reflectionStrengthOverride : reflectionStrength;
+    roughness = clamp(roughness, 0.0f, 1.0f);
+
+    float NdotV = saturate(dot(N, V));
+    float mipLevel = roughness * float(max(1u, relight.prefilteredMipCount) - 1u);
+
+    float3 prefiltered = prefilteredEnv.sample(iblSampler, sampleR, level(mipLevel)).rgb * relight.envIntensity;
+    float2 fg = brdfLUT.sample(iblSampler, float2(NdotV, roughness), level(0)).rg;
+
+    float3 F0 = mix(float3(0.04f), oriColor, reflectionStrength);
+    float3 specular = prefiltered * (F0 * fg.x + fg.y);
+
+    float3 finalColor = (1.0f - reflectionStrength) * baseColor + specular;
+
+    switch (relight.debugMode) {
+        case 1: finalColor = N * 0.5f + 0.5f; break;
+        case 2: finalColor = float3(roughness); break;
+        case 3: finalColor = float3(reflectionStrength); break;
+        case 4: finalColor = prefiltered; break;
+        case 5: finalColor = irradianceEnv.sample(iblSampler, sampleN, level(0)).rgb * relight.envIntensity; break;
+        case 6: finalColor = oriColor; break;   // ori_color (albedo) channel
+        default: break;
+    }
+
+    return half3(finalColor);
+}

@@ -1,5 +1,6 @@
 import Foundation
 import PLYIO
+import simd
 
 public class SplatPLYSceneReader: SplatSceneReader {
     enum Error: LocalizedError {
@@ -90,6 +91,14 @@ private struct ElementInputMapping {
 
     static let sphericalHarmonicsCount = 45
 
+    /// Property indices for Ref-Gaussian (2DGS) PBR material attributes.
+    struct MaterialMapping {
+        let reflectionStrengthIndex: Int
+        let roughnessIndex: Int
+        let specularTintIndices: SIMD3<Int>     // ori_color_0..2
+        let normalDeltaIndices: SIMD3<Int>?     // nx/ny/nz residual (nil -> use geometric normal only)
+    }
+
     let elementTypeIndex: Int
 
     let positionXPropertyIndex: Int
@@ -98,12 +107,13 @@ private struct ElementInputMapping {
     let colorPropertyIndices: Color
     let scaleXPropertyIndex: Int
     let scaleYPropertyIndex: Int
-    let scaleZPropertyIndex: Int
+    let scaleZPropertyIndex: Int?           // nil for 2DGS surfels (Ref-Gaussian): a thin 3rd axis is synthesized on read
     let opacityPropertyIndex: Int
     let rotation0PropertyIndex: Int
     let rotation1PropertyIndex: Int
     let rotation2PropertyIndex: Int
     let rotation3PropertyIndex: Int
+    let material: MaterialMapping?          // non-nil for Ref-Gaussian relightable scenes
 
     static func elementMapping(for header: PLYHeader) throws -> ElementInputMapping {
         guard let elementTypeIndex = header.index(forElementNamed: SplatPLYConstants.ElementName.point.rawValue) else {
@@ -159,13 +169,36 @@ private struct ElementInputMapping {
 
         let scaleXPropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.scaleX)
         let scaleYPropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.scaleY)
-        let scaleZPropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.scaleZ)
+        // Ref-Gaussian / 2DGS surfels have no scale_2; treat it as optional and synthesize a thin axis on read.
+        let scaleZPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: SplatPLYConstants.PropertyName.scaleZ)
         let opacityPropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.opacity)
 
         let rotation0PropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.rotation0)
         let rotation1PropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.rotation1)
         let rotation2PropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.rotation2)
         let rotation3PropertyIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.rotation3)
+
+        // Detect Ref-Gaussian relightable material: presence of refl_strength implies the PBR channels.
+        let material: MaterialMapping?
+        if let reflectionStrengthIndex = try headerElement.index(forOptionalFloat32PropertyNamed: SplatPLYConstants.PropertyName.reflectionStrength) {
+            let roughnessIndex = try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.roughness)
+            let specularTintIndices = SIMD3<Int>(
+                try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.specularTintR),
+                try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.specularTintG),
+                try headerElement.index(forFloat32PropertyNamed: SplatPLYConstants.PropertyName.specularTintB))
+            var normalDeltaIndices: SIMD3<Int>? = nil
+            if let nx = try headerElement.index(forOptionalFloat32PropertyNamed: SplatPLYConstants.PropertyName.normalX),
+               let ny = try headerElement.index(forOptionalFloat32PropertyNamed: SplatPLYConstants.PropertyName.normalY),
+               let nz = try headerElement.index(forOptionalFloat32PropertyNamed: SplatPLYConstants.PropertyName.normalZ) {
+                normalDeltaIndices = SIMD3<Int>(nx, ny, nz)
+            }
+            material = MaterialMapping(reflectionStrengthIndex: reflectionStrengthIndex,
+                                       roughnessIndex: roughnessIndex,
+                                       specularTintIndices: specularTintIndices,
+                                       normalDeltaIndices: normalDeltaIndices)
+        } else {
+            material = nil
+        }
 
         return ElementInputMapping(elementTypeIndex: elementTypeIndex,
                                    positionXPropertyIndex: positionXPropertyIndex,
@@ -179,7 +212,8 @@ private struct ElementInputMapping {
                                    rotation0PropertyIndex: rotation0PropertyIndex,
                                    rotation1PropertyIndex: rotation1PropertyIndex,
                                    rotation2PropertyIndex: rotation2PropertyIndex,
-                                   rotation3PropertyIndex: rotation3PropertyIndex)
+                                   rotation3PropertyIndex: rotation3PropertyIndex,
+                                   material: material)
     }
 }
 
@@ -211,15 +245,53 @@ private extension SplatPoint {
                                      try element.uint8Value(forPropertyIndex: propertyIndices.z)))
         }
 
-        scale =
-            .exponent(SIMD3(try element.float32Value(forPropertyIndex: mapping.scaleXPropertyIndex),
-                            try element.float32Value(forPropertyIndex: mapping.scaleYPropertyIndex),
-                            try element.float32Value(forPropertyIndex: mapping.scaleZPropertyIndex)))
+        let scaleXRaw = try element.float32Value(forPropertyIndex: mapping.scaleXPropertyIndex)
+        let scaleYRaw = try element.float32Value(forPropertyIndex: mapping.scaleYPropertyIndex)
+        if let scaleZPropertyIndex = mapping.scaleZPropertyIndex {
+            scale = .exponent(SIMD3(scaleXRaw, scaleYRaw,
+                                    try element.float32Value(forPropertyIndex: scaleZPropertyIndex)))
+        } else {
+            // 2DGS surfel: no 3rd scale. Synthesize a thin axis in log-space so the existing
+            // 3D-covariance path renders the surfel as a flat disk along its normal.
+            // exp(min(sx,sy) + ln(0.1)) == 0.1 * min(scaleX, scaleY) in linear space.
+            let thinZRaw = min(scaleXRaw, scaleYRaw) + Float(log(0.1))
+            scale = .exponent(SIMD3(scaleXRaw, scaleYRaw, thinZRaw))
+        }
         opacity = .logitFloat(try element.float32Value(forPropertyIndex: mapping.opacityPropertyIndex))
         rotation.real   = try element.float32Value(forPropertyIndex: mapping.rotation0PropertyIndex)
         rotation.imag.x = try element.float32Value(forPropertyIndex: mapping.rotation1PropertyIndex)
         rotation.imag.y = try element.float32Value(forPropertyIndex: mapping.rotation2PropertyIndex)
         rotation.imag.z = try element.float32Value(forPropertyIndex: mapping.rotation3PropertyIndex)
+
+        if let materialMapping = mapping.material {
+            func sigmoid(_ x: Float) -> Float { 1 / (1 + exp(-x)) }
+            let roughness = sigmoid(try element.float32Value(forPropertyIndex: materialMapping.roughnessIndex))
+            let reflectionStrength = sigmoid(try element.float32Value(forPropertyIndex: materialMapping.reflectionStrengthIndex))
+            let specularTint = SIMD3<Float>(
+                sigmoid(try element.float32Value(forPropertyIndex: materialMapping.specularTintIndices.x)),
+                sigmoid(try element.float32Value(forPropertyIndex: materialMapping.specularTintIndices.y)),
+                sigmoid(try element.float32Value(forPropertyIndex: materialMapping.specularTintIndices.z)))
+
+            // Reconstruct the shading normal: 2DGS geometric normal (surfel local z-axis, i.e. the
+            // rotation applied to +Z) plus the learned residual (nx,ny,nz), renormalized.
+            // The view-dependent flip + second residual (nx2..) are deferred to the shader (faceforward).
+            let geometricNormal = rotation.normalized.act(SIMD3<Float>(0, 0, 1))
+            var normal = geometricNormal
+            if let normalDeltaIndices = materialMapping.normalDeltaIndices {
+                let delta = SIMD3<Float>(
+                    try element.float32Value(forPropertyIndex: normalDeltaIndices.x),
+                    try element.float32Value(forPropertyIndex: normalDeltaIndices.y),
+                    try element.float32Value(forPropertyIndex: normalDeltaIndices.z))
+                normal = geometricNormal + delta
+            }
+            let normalLength = simd_length(normal)
+            let unitNormal = normalLength > 1e-6 ? normal / normalLength : geometricNormal
+
+            material = SplatPoint.Material(normal: unitNormal,
+                                           roughness: roughness,
+                                           reflectionStrength: reflectionStrength,
+                                           specularTint: specularTint)
+        }
     }
 }
 

@@ -27,6 +27,10 @@ public struct SplatChunk: @unchecked Sendable {
     /// For SH3: 45 Float16 values per splat (15 coefficients × 3 RGB, cumulative)
     public let shCoefficients: MetalBuffer<Float16>?
 
+    /// Optional buffer of per-splat PBR material attributes for relightable rendering.
+    /// `nil` if this chunk carries no material.
+    public let materials: MetalBuffer<EncodedSplatMaterial>?
+
     /// The spherical harmonics degree for this chunk.
     /// All splats in a chunk share the same SH degree.
     public let shDegree: SHDegree
@@ -41,9 +45,11 @@ public struct SplatChunk: @unchecked Sendable {
     ///   - shDegree: The spherical harmonics degree for this chunk
     public init(splats: MetalBuffer<EncodedSplatPoint>,
                 shCoefficients: MetalBuffer<Float16>? = nil,
+                materials: MetalBuffer<EncodedSplatMaterial>? = nil,
                 shDegree: SHDegree = .sh0) {
         self.splats = splats
         self.shCoefficients = shCoefficients
+        self.materials = materials
         self.shDegree = shDegree
     }
 
@@ -63,6 +69,28 @@ public struct SplatChunk: @unchecked Sendable {
         for (i, point) in points.enumerated() {
             splatBuffer.values[i] = EncodedSplatPoint(point)
         }
+
+        // Always build a per-splat material buffer so any scene can be relit. For standard 3DGS
+        // (no material), EncodedSplatMaterial synthesizes a normal from the splat geometry.
+        //
+        // 2DGS surfels (e.g. Ref-Gaussian) have a sign-ambiguous normal — the disk is two-sided, so
+        // ~half the stored normals point inward. Left as-is they blend into noise (the directions are
+        // smooth, but the signs are random). Orient them consistently outward from the cloud centroid,
+        // which resolves the sign globally for a mostly-convex object and yields a smooth normal field.
+        let materialBuffer = try MetalBuffer<EncodedSplatMaterial>(device: device, capacity: points.count)
+        materialBuffer.count = points.count
+        var positionSum = SIMD3<Float>.zero
+        for point in points { positionSum += point.position }
+        let centroid = points.isEmpty ? .zero : positionSum / Float(points.count)
+        for (i, point) in points.enumerated() {
+            var material = EncodedSplatMaterial(point)
+            let normal = SIMD3<Float>(Float(material.normal.x), Float(material.normal.y), Float(material.normal.z))
+            if simd_dot(normal, point.position - centroid) < 0 {
+                material.normal = PackedHalf3(-normal)
+            }
+            materialBuffer.values[i] = material
+        }
+        self.materials = materialBuffer
 
         // Create SH coefficient buffer if we have higher-order SH
         if shDegree > .sh0 {

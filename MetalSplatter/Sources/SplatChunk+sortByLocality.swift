@@ -64,6 +64,14 @@ extension SplatChunk {
             let coeffsPerSplat = shDegree.extraCoefficientCount * 3  // RGB per coefficient
             shBuffer.values.reorderGroupsInPlace(fromSourceIndices: sorted, groupSize: coeffsPerSplat)
         }
+
+        // Also reorder the per-splat material buffer (normal / roughness / reflectionStrength /
+        // ori_color) to maintain correspondence with splats. Without this, after the Morton sort each
+        // splat is paired with a DIFFERENT splat's material, scrambling the normals into rainbow noise
+        // (the deferred relighting reads its normal from here, not from the splat geometry).
+        if let materialsBuffer = materials {
+            materialsBuffer.values.reorderInPlace(fromSourceIndices: sorted)
+        }
     }
 }
 

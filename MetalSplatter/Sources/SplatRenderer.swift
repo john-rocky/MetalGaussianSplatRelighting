@@ -24,7 +24,10 @@ public final class SplatRenderer: @unchecked Sendable {
         // simultaneous chunks (enabled + disabled) is UInt16.max.
         static let maxChunks = Int(UInt16.max)
 
-        static let tileSize = MTLSize(width: 32, height: 32, depth: 1)
+        // 16x16 (not 32x32) so the expanded multi-stage G-buffer (color + normal/roughness +
+        // viewDir/reflection + depth, used for deferred relighting) stays well under the per-tile
+        // imageblock memory limit.
+        static let tileSize = MTLSize(width: 16, height: 16, depth: 1)
     }
 
     private static let log =
@@ -50,6 +53,7 @@ public final class SplatRenderer: @unchecked Sendable {
         case uniforms    = 0
         case chunks      = 1
         case splatIndex  = 2
+        case relight     = 3
     }
 
     // Keep in sync with Shaders.metal : Uniforms
@@ -91,14 +95,42 @@ public final class SplatRenderer: @unchecked Sendable {
     }
 
     // Keep in sync with Shaders.metal : ChunkInfo
-    // Expected layout: splatsPointer (8), shCoefficientsPointer (8), splatCount (4), shDegree (1), enabled (1), padding (2) = 24 bytes
+    // Expected layout: splatsPointer (8), shCoefficientsPointer (8), materialsPointer (8), splatCount (4), shDegree (1), enabled (1), padding (2) = 32 bytes
     struct GPUChunkInfo {
         var splatsPointer: UInt64             // device pointer to splats
         var shCoefficientsPointer: UInt64     // device pointer to SH coefficients (0 for SH0)
+        var materialsPointer: UInt64          // device pointer to per-splat materials (0 if none)
         var splatCount: UInt32
         var shDegree: UInt8                   // SHDegree enum value
         var enabled: UInt8                    // Non-zero = enabled for rendering
         var _shPadding: (UInt8, UInt8) = (0, 0)
+    }
+
+    // Keep in sync with ShaderCommon.h : RelightUniforms (160 bytes)
+    struct RelightUniforms {
+        var envRotation: matrix_float4x4
+        var inverseViewProjection: matrix_float4x4
+        var enabled: UInt32
+        var debugMode: UInt32
+        var prefilteredMipCount: UInt32
+        var envIntensity: Float
+        var roughnessOverride: Float
+        var reflectionStrengthOverride: Float
+        var screenSize: SIMD2<Float> = .zero
+    }
+
+    /// User-facing relightable-rendering settings. Mutate between frames to control IBL.
+    public struct RelightSettings: Sendable {
+        public var isEnabled: Bool = false
+        public var environmentRotation: matrix_float4x4 = matrix_identity_float4x4
+        public var environmentIntensity: Float = 1.0
+        /// 0 shaded, 1 normal, 2 roughness, 3 reflectionStrength, 4 prefiltered environment.
+        public var debugMode: UInt32 = 0
+        /// < 0 uses per-splat roughness; >= 0 overrides it (useful for synthetic 3DGS materials).
+        public var roughnessOverride: Float = -1
+        /// < 0 uses per-splat reflection strength; >= 0 overrides it.
+        public var reflectionStrengthOverride: Float = -1
+        public init() {}
     }
 
     public let device: MTLDevice
@@ -117,6 +149,12 @@ public final class SplatRenderer: @unchecked Sendable {
      The color to clear the render target to before rendering splats.
      */
     public let clearColor: MTLClearColor
+
+    /// The image-based-lighting environment used when relighting is enabled. `nil` disables relighting.
+    public var environment: IBLEnvironment?
+
+    /// Relightable rendering settings (enable flag, environment rotation, debug mode, overrides).
+    public var relightSettings = RelightSettings()
 
     private var writeDepth: Bool {
         depthFormat != .invalid
@@ -151,6 +189,12 @@ public final class SplatRenderer: @unchecked Sendable {
     }
 
     private let library: MTLLibrary
+
+    // Resources for relightable rendering. The dummy textures satisfy the shaders' texture
+    // bindings when no environment is set (relighting is off in that case).
+    private let iblSampler: MTLSamplerState
+    private let dummyCube: MTLTexture
+    private let dummyLUT: MTLTexture
 
     // MARK: - Chunk Storage
 
@@ -297,6 +341,45 @@ public final class SplatRenderer: @unchecked Sendable {
         } catch {
             fatalError("Unable to initialize SplatRenderer: \(error)")
         }
+
+        let samplerDescriptor = MTLSamplerDescriptor()
+        samplerDescriptor.minFilter = .linear
+        samplerDescriptor.magFilter = .linear
+        samplerDescriptor.mipFilter = .linear
+        samplerDescriptor.sAddressMode = .clampToEdge
+        samplerDescriptor.tAddressMode = .clampToEdge
+        samplerDescriptor.rAddressMode = .clampToEdge
+        guard let iblSampler = device.makeSamplerState(descriptor: samplerDescriptor) else {
+            fatalError("Unable to create IBL sampler state")
+        }
+        self.iblSampler = iblSampler
+
+        let dummyCubeDescriptor = MTLTextureDescriptor.textureCubeDescriptor(pixelFormat: .rgba16Float, size: 1, mipmapped: false)
+        dummyCubeDescriptor.usage = .shaderRead
+        dummyCubeDescriptor.storageMode = .private
+        let dummyLUTDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: 1, height: 1, mipmapped: false)
+        dummyLUTDescriptor.usage = .shaderRead
+        dummyLUTDescriptor.storageMode = .private
+        guard let dummyCube = device.makeTexture(descriptor: dummyCubeDescriptor),
+              let dummyLUT = device.makeTexture(descriptor: dummyLUTDescriptor) else {
+            fatalError("Unable to create IBL placeholder textures")
+        }
+        self.dummyCube = dummyCube
+        self.dummyLUT = dummyLUT
+    }
+
+    private func makeRelightUniforms(inverseViewProjection: matrix_float4x4 = matrix_identity_float4x4,
+                                     screenSize: SIMD2<Float> = .zero) -> RelightUniforms {
+        let active = relightSettings.isEnabled && environment != nil
+        return RelightUniforms(envRotation: relightSettings.environmentRotation,
+                               inverseViewProjection: inverseViewProjection,
+                               enabled: active ? 1 : 0,
+                               debugMode: relightSettings.debugMode,
+                               prefilteredMipCount: UInt32(environment?.prefilteredMipCount ?? 1),
+                               envIntensity: relightSettings.environmentIntensity,
+                               roughnessOverride: relightSettings.roughnessOverride,
+                               reflectionStrengthOverride: relightSettings.reflectionStrengthOverride,
+                               screenSize: screenSize)
     }
 
     // MARK: - Chunk Management
@@ -685,10 +768,12 @@ public final class SplatRenderer: @unchecked Sendable {
         let chunksPtr = buffer.contents().assumingMemoryBound(to: GPUChunkInfo.self)
         for (chunkIndex, entry) in allChunks.enumerated() {
             let shPointer = entry.chunk.shCoefficients?.buffer.gpuAddress ?? 0
+            let materialsPointer = entry.chunk.materials?.buffer.gpuAddress ?? 0
 
             chunksPtr[chunkIndex] = GPUChunkInfo(
                 splatsPointer: entry.chunk.splats.buffer.gpuAddress,
                 shCoefficientsPointer: shPointer,
+                materialsPointer: materialsPointer,
                 splatCount: UInt32(entry.chunk.splatCount),
                 shDegree: entry.chunk.shDegree.rawValue,
                 enabled: entry.isEnabled ? 1 : 0
@@ -925,12 +1010,24 @@ public final class SplatRenderer: @unchecked Sendable {
         renderEncoder.setVertexBuffer(chunksBuffer, offset: 0, index: BufferIndex.chunks.rawValue)
         renderEncoder.setVertexBuffer(splatIndexBuffer.buffer, offset: 0, index: BufferIndex.splatIndex.rawValue)
 
+        // Relighting: bind environment textures (or dummies), the sampler, and per-frame params.
+        // When relighting is off, relight.enabled is 0 and the shader does not sample the textures.
+        var relightUniforms = makeRelightUniforms()
+        renderEncoder.setVertexBytes(&relightUniforms, length: MemoryLayout<RelightUniforms>.stride, index: BufferIndex.relight.rawValue)
+        renderEncoder.setVertexTexture(environment?.prefilteredCubemap ?? dummyCube, index: 0)
+        renderEncoder.setVertexTexture(environment?.brdfLUT ?? dummyLUT, index: 1)
+        renderEncoder.setVertexTexture(environment?.irradianceCubemap ?? dummyCube, index: 2)
+        renderEncoder.setVertexSamplerState(iblSampler, index: 0)
+
         // Make splat and SH coefficient buffers resident for all chunks (enabled + disabled).
         // The shader may briefly access disabled chunks' pointers before the enabled check.
         for entry in allChunks {
             renderEncoder.useResource(entry.chunk.splats.buffer, usage: .read, stages: .vertex)
             if let shBuffer = entry.chunk.shCoefficients?.buffer {
                 renderEncoder.useResource(shBuffer, usage: .read, stages: .vertex)
+            }
+            if let materialsBuffer = entry.chunk.materials?.buffer {
+                renderEncoder.useResource(materialsBuffer, usage: .read, stages: .vertex)
             }
         }
 
@@ -951,6 +1048,20 @@ public final class SplatRenderer: @unchecked Sendable {
             renderEncoder.setRenderPipelineState(postprocessPipelineState)
             renderEncoder.setDepthStencilState(renderState.postprocessDepthState)
             renderEncoder.setCullMode(.none)
+            // Deferred relighting runs here, per pixel, on the blended G-buffer. Pass the inverse
+            // view-projection + screen size so the postprocess can reconstruct per-pixel rays and
+            // draw the environment as a skybox background (matching the splats' reflections).
+            let skyViewport = viewports.first
+            let inverseViewProjection = skyViewport.map { ($0.projectionMatrix * $0.viewMatrix).inverse } ?? matrix_identity_float4x4
+            let skyScreenSize = skyViewport.map { SIMD2<Float>(Float($0.screenSize.x), Float($0.screenSize.y)) } ?? .zero
+            var postprocessRelight = makeRelightUniforms(inverseViewProjection: inverseViewProjection,
+                                                         screenSize: skyScreenSize)
+            renderEncoder.setFragmentBytes(&postprocessRelight, length: MemoryLayout<RelightUniforms>.stride, index: 0)
+            renderEncoder.setFragmentTexture(environment?.prefilteredCubemap ?? dummyCube, index: 0)
+            renderEncoder.setFragmentTexture(environment?.brdfLUT ?? dummyLUT, index: 1)
+            renderEncoder.setFragmentTexture(environment?.irradianceCubemap ?? dummyCube, index: 2)
+            renderEncoder.setFragmentTexture(environment?.equirectangular ?? dummyLUT, index: 3)  // full-res skybox
+            renderEncoder.setFragmentSamplerState(iblSampler, index: 0)
             renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             renderEncoder.popDebugGroup()
         } else {

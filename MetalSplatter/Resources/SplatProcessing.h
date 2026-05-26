@@ -37,3 +37,34 @@ FragmentIn splatVertex(Splat splat,
 // MARK: - Fragment Processing
 
 half splatFragmentAlpha(half2 relativePosition, half splatAlpha);
+
+// MARK: - Relighting (split-sum IBL)
+
+/// Computes a relit color for a splat using split-sum image-based lighting.
+/// `baseColorLinear` is the splat's existing (SH-evaluated, linear) color, used as the diffuse term.
+/// Returns the final linear color: (1 - reflectionStrength) * base + specular.
+half3 shadePBR(half3 baseColorLinear,
+               SplatMaterial material,
+               float3 worldPosition,
+               float3 cameraPosition,
+               constant RelightUniforms &relight,
+               texturecube<float> prefilteredEnv,
+               texturecube<float> irradianceEnv,
+               texture2d<float> brdfLUT,
+               sampler iblSampler);
+
+/// Deferred split-sum IBL shading. Takes explicit per-pixel inputs (already blended + normalized in
+/// the multi-stage postprocess), so the noisy per-splat normals are averaged before shading.
+/// `baseColorLinear` is the SH diffuse base color; `oriColorLinear` is the Ref-Gaussian albedo
+/// (ori_color) that tints the specular F0. final = (1 - refl) * base + specular.
+half3 shadeIBLDeferred(half3 baseColorLinear,
+                       half3 oriColorLinear,
+                       float3 N,
+                       float3 V,
+                       float roughness,
+                       float reflectionStrength,
+                       constant RelightUniforms &relight,
+                       texturecube<float> prefilteredEnv,
+                       texturecube<float> irradianceEnv,
+                       texture2d<float> brdfLUT,
+                       sampler iblSampler);

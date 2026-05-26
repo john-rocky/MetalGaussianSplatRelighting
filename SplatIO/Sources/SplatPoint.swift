@@ -207,22 +207,52 @@ public struct SplatPoint: Sendable {
         }
     }
 
+    /// Per-splat physically-based material attributes for relightable Gaussian Splatting
+    /// (e.g. Ref-Gaussian scenes). `nil` for standard 3DGS scenes.
+    /// Values are stored linear / post-activation (sigmoid already applied where relevant).
+    public struct Material: Sendable {
+        /// Object-space surface normal, reconstructed from the 2DGS surfel orientation
+        /// plus the learned residual, normalized.
+        public var normal: SIMD3<Float>
+        /// GGX roughness in [0, 1].
+        public var roughness: Float
+        /// Reflection strength / specular ratio in [0, 1]; blends diffuse vs. specular
+        /// (Ref-Gaussian `refl_strength`).
+        public var reflectionStrength: Float
+        /// Specular tint / F0 color in [0, 1] (Ref-Gaussian `ori_color`).
+        public var specularTint: SIMD3<Float>
+
+        public init(normal: SIMD3<Float>,
+                    roughness: Float,
+                    reflectionStrength: Float,
+                    specularTint: SIMD3<Float>) {
+            self.normal = normal
+            self.roughness = roughness
+            self.reflectionStrength = reflectionStrength
+            self.specularTint = specularTint
+        }
+    }
+
     public var position: SIMD3<Float>
     public var color: Color
     public var opacity: Opacity
     public var scale: Scale
     public var rotation: simd_quatf
+    /// Optional PBR material for relightable scenes; `nil` for standard 3DGS.
+    public var material: Material?
 
     public init(position: SIMD3<Float>,
                 color: Color,
                 opacity: Opacity,
                 scale: Scale,
-                rotation: simd_quatf) {
+                rotation: simd_quatf,
+                material: Material? = nil) {
         self.position = position
         self.color = color
         self.opacity = opacity
         self.scale = scale
         self.rotation = rotation
+        self.material = material
     }
 
     /// Returns a normalized version with all values converted to their float representations.
@@ -232,7 +262,8 @@ public struct SplatPoint: Sendable {
                         color: .sphericalHarmonicFloat([color.sh0]),
                         opacity: .linearFloat(opacity.asLinearFloat),
                         scale: .linearFloat(scale.asLinearFloat),
-                        rotation: rotation.normalized)
+                        rotation: rotation.normalized,
+                        material: material)
     }
 }
 

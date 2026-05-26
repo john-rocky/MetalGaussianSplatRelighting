@@ -25,5 +25,17 @@ struct SplatPLYConstants {
         static let rotation1 = [ "rot_1" ]
         static let rotation2 = [ "rot_2" ]
         static let rotation3 = [ "rot_3" ]
+
+        // MARK: Ref-Gaussian (2DGS) relightable material properties.
+        // Note: Ref-Gaussian PLYs are 2D surfels with only scale_0 / scale_1 (scale_2 is absent).
+        // The primary normal residual reuses normalX/Y/Z ("nx"/"ny"/"nz") above.
+        static let reflectionStrength = [ "refl_strength" ]
+        static let roughness = [ "roughness" ]
+        static let specularTintR = [ "ori_color_0" ]
+        static let specularTintG = [ "ori_color_1" ]
+        static let specularTintB = [ "ori_color_2" ]
+        static let normal2X = [ "nx2" ]
+        static let normal2Y = [ "ny2" ]
+        static let normal2Z = [ "nz2" ]
     }
 }

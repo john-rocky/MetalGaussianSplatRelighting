@@ -40,6 +40,7 @@ enum BufferIndex: int32_t
     BufferIndexUniforms    = 0,
     BufferIndexChunks      = 1,
     BufferIndexSplatIndex  = 2,
+    BufferIndexRelight     = 3,
 };
 
 typedef struct
@@ -72,6 +73,21 @@ typedef struct
     Uniforms uniforms[kMaxViewCount];
 } UniformsArray;
 
+// Relightable rendering parameters. Bound at BufferIndexRelight to the splat vertex shaders.
+// Keep in sync with Swift: SplatRenderer.RelightUniforms (160 bytes)
+typedef struct
+{
+    matrix_float4x4 envRotation;          // rotates the world-space sample direction (environment orientation)
+    matrix_float4x4 inverseViewProjection;// unprojects screen pixels to world-space rays (skybox background)
+    uint enabled;                         // 0 = standard SH path, non-zero = split-sum IBL relight
+    uint debugMode;                       // 0 shaded, 1 normal, 2 roughness, 3 reflectionStrength
+    uint prefilteredMipCount;             // mip levels in the prefiltered environment cubemap
+    float envIntensity;                   // scales sampled environment radiance
+    float roughnessOverride;              // >= 0 overrides per-splat roughness (useful for synthetic materials)
+    float reflectionStrengthOverride;     // >= 0 overrides per-splat reflection strength
+    vector_float2 screenSize;             // render-target size in pixels (skybox ray reconstruction)
+} RelightUniforms;
+
 // Keep in sync with EncodedSplatPoint
 typedef struct
 {
@@ -80,6 +96,15 @@ typedef struct
     packed_half3 covA;
     packed_half3 covB;
 } Splat;
+
+// Keep in sync with Swift: EncodedSplatMaterial (16 bytes)
+typedef struct
+{
+    packed_half3 normal;             // world-space surface normal
+    packed_half3 specularTint;       // specular tint / F0 color
+    half roughness;
+    half reflectionStrength;         // blends diffuse vs. specular
+} SplatMaterial;
 
 // Keep in sync with Swift: ChunkedSplatIndex
 typedef struct
@@ -94,6 +119,7 @@ typedef struct
 {
     device Splat* splats;
     device half* shCoefficients;   // Null for SH degree 0, otherwise higher-order SH coefficients
+    device SplatMaterial* materials; // Null if this chunk has no relightable material
     uint32_t splatCount;
     SHDegree shDegree;             // Spherical harmonics degree for this chunk
     uint8_t enabled;               // Non-zero = enabled for rendering
@@ -105,4 +131,9 @@ typedef struct
     float4 position [[position]];
     half2 relativePosition; // Ranges from -kBoundsRadius to +kBoundsRadius
     half4 color;
+    // Deferred relighting G-buffer inputs (multi-stage path). Per-splat, constant across the quad.
+    half3 gNormal;   // world-space surface normal, faceforwarded toward the camera
+    half3 gView;     // world-space view direction (camera - splat center)
+    half2 gMaterial; // (roughness, reflectionStrength)
+    half3 gOriColor; // ori_color (Ref-Gaussian albedo / specular F0 tint), in [0,1]
 } FragmentIn;

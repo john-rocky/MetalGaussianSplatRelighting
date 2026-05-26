@@ -3,6 +3,9 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var isPickingFile = false
+#if os(iOS)
+    @State private var relightControls = RelightControls()
+#endif
 
 #if os(macOS)
     @Environment(\.openWindow) private var openWindow
@@ -39,8 +42,14 @@ struct ContentView: View {
         NavigationStack(path: $navigationPath) {
             mainView
                 .navigationDestination(for: ModelIdentifier.self) { modelIdentifier in
-                    MetalKitSceneView(modelIdentifier: modelIdentifier)
+                    MetalKitSceneView(modelIdentifier: modelIdentifier, relightControls: relightControls)
                         .navigationTitle(modelIdentifier.description)
+                        .overlay(alignment: .bottom) {
+                            if case .gaussianSplat = modelIdentifier {
+                                RelightControlsView(controls: relightControls)
+                                    .padding()
+                            }
+                        }
                 }
         }
 #endif // os(iOS)
