@@ -35,7 +35,29 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var lastRotationUpdateTimestamp: Date? = nil
     var rotation: Angle = .zero
 
+    // Orbit camera state. Until the user first interacts, the model gently auto-yaws (idle demo);
+    // any drag/pinch takes over. Yaw spins about the (corrected) up axis, pitch tilts up/down,
+    // distance is the camera's distance from the model for pinch-zoom.
+    var cameraYaw: Angle = .zero
+    var cameraPitch: Angle = Constants.cameraInitialPitch
+    var cameraDistance: Float = Constants.cameraInitialDistance
+    var userHasInteracted = false
+
     var drawableSize: CGSize = .zero
+
+    /// Apply an orbit drag (screen-point deltas). Disables auto-rotation on first use.
+    func orbitBy(dx: Float, dy: Float) {
+        userHasInteracted = true
+        cameraYaw += Angle(radians: Double(dx * Constants.cameraOrbitRadiansPerPoint))
+        let newPitch = cameraPitch.radians + Double(dy * Constants.cameraOrbitRadiansPerPoint)
+        cameraPitch = Angle(radians: min(max(newPitch, -Constants.cameraPitchLimit.radians), Constants.cameraPitchLimit.radians))
+    }
+
+    /// Apply a pinch-zoom. `scale` is the gesture's cumulative scale relative to `referenceDistance`.
+    func zoomBy(scale: Float, referenceDistance: Float) {
+        userHasInteracted = true
+        cameraDistance = min(max(referenceDistance / max(scale, 0.0001), Constants.cameraMinDistance), Constants.cameraMaxDistance)
+    }
 
     init?(_ metalKitView: MTKView) {
         self.device = metalKitView.device!
@@ -97,18 +119,22 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                              nearZ: 0.1,
                                                              farZ: 100.0)
 
-        let rotationMatrix = matrix4x4_rotation(radians: Float(rotation.radians),
-                                                axis: Constants.rotationAxis)
-        let translationMatrix = matrix4x4_translation(0.0, 0.0, Constants.modelCenterZ)
-        // Turn common 3D GS PLY files rightside-up. This isn't generally meaningful, it just
-        // happens to be a useful default for the most common datasets at the moment.
-        let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
+        // Orbit camera: pull back by the (pinch-controlled) distance, then pitch and yaw around the
+        // model. Before the first user interaction we add a gentle auto-yaw for an idle demo.
+        let autoYaw = userHasInteracted ? 0 : Float(rotation.radians)
+        let yawMatrix = matrix4x4_rotation(radians: Float(cameraYaw.radians) + autoYaw, axis: SIMD3<Float>(0, 1, 0))
+        let pitchMatrix = matrix4x4_rotation(radians: Float(cameraPitch.radians), axis: SIMD3<Float>(1, 0, 0))
+        let translationMatrix = matrix4x4_translation(0.0, 0.0, -cameraDistance)
+
+        // Ref-NeRF / Blender datasets (helmet, car, ...) are Z-up, but this viewer's camera is Y-up,
+        // which otherwise renders them rolled 90° onto their side. Map data +Z -> viewer +Y.
+        let upCalibration = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
 
         let viewport = MTLViewport(originX: 0, originY: 0, width: drawableSize.width, height: drawableSize.height, znear: 0, zfar: 1)
 
         return ModelRendererViewportDescriptor(viewport: viewport,
                                                projectionMatrix: projectionMatrix,
-                                               viewMatrix: translationMatrix * rotationMatrix * commonUpCalibration,
+                                               viewMatrix: translationMatrix * pitchMatrix * yawMatrix * upCalibration,
                                                screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
     }
 
@@ -150,8 +176,14 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             }
             var settings = SplatRenderer.RelightSettings()
             settings.isEnabled = controls.isEnabled && splat.environment != nil
-            settings.environmentRotation = matrix4x4_rotation(radians: Float(controls.rotationDegrees * .pi / 180.0),
-                                                              axis: SIMD3<Float>(0, 1, 0))
+            // The IBL environment is authored Y-up, but the scene (Ref-NeRF/Blender) is Z-up. The
+            // shader samples the env (skybox rays + reflections) with scene-space directions, so map
+            // them into the env's Y-up frame (Z-up -> Y-up); the rotation slider spins about the
+            // scene up axis (Z) first. Without this the background/reflections are rolled 90°.
+            let envYaw = matrix4x4_rotation(radians: Float(controls.rotationDegrees * .pi / 180.0),
+                                            axis: SIMD3<Float>(0, 0, 1))
+            let zUpToYUp = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            settings.environmentRotation = zUpToYUp * envYaw
             settings.environmentIntensity = Float(controls.environmentIntensity)
             settings.debugMode = UInt32(controls.debugMode)
             settings.roughnessOverride = controls.useTrainedMaterial ? -1 : Float(controls.roughness)
@@ -192,9 +224,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             return
         }
         let equirect: MTLTexture?
-        switch choice {
-        case .procedural: equirect = ProceduralSky.makeEquirectangular(device: device)
-        case .studio:     equirect = EquirectEnvironment.loadBundled(device: device, resource: "studio_env")
+        if let resource = choice.resourceName {
+            equirect = EquirectEnvironment.loadBundled(device: device, resource: resource)
+        } else {
+            equirect = ProceduralSky.makeEquirectangular(device: device)
         }
         if let equirect, let environment = try? IBLEnvironment(device: device, equirectangular: equirect) {
             environmentCache[choice] = environment
@@ -214,11 +247,25 @@ final class RelightControls {
     /// Selectable image-based-lighting environment. `studio` loads a bundled HDR panorama; reflections
     /// (and the Env-rotation slider) respond to whichever is chosen.
     enum EnvironmentChoice: Int, CaseIterable, Identifiable {
-        case studio, procedural
+        case autoshop, studio, procedural
         var id: Int { rawValue }
-        var label: String { self == .studio ? "Studio" : "Procedural" }
+        var label: String {
+            switch self {
+            case .autoshop: return "Auto Shop"
+            case .studio: return "Studio"
+            case .procedural: return "Procedural"
+            }
+        }
+        /// Bundled equirect resource name, or nil for the procedural sky.
+        var resourceName: String? {
+            switch self {
+            case .autoshop: return "autoshop_env"
+            case .studio: return "studio_env"
+            case .procedural: return nil
+            }
+        }
     }
-    var environmentChoice: EnvironmentChoice = .studio
+    var environmentChoice: EnvironmentChoice = .autoshop
     var isEnabled: Bool = true
     /// When true, use each splat's trained per-splat roughness / reflection; when false the sliders
     /// override every splat globally (useful for standard 3DGS scenes with synthesized materials).
@@ -254,7 +301,7 @@ enum ProceduralSky {
         let ground = SIMD3<Float>(0.20, 0.18, 0.16)
         let sunColor = SIMD3<Float>(1.0, 0.95, 0.85)
 
-        var pixels = [UInt16](repeating: 0, count: width * height * 4)
+        var pixels = [Float16](repeating: 0, count: width * height * 4)
         for y in 0..<height {
             let v = (Float(y) + 0.5) / Float(height)
             let theta = v * Float.pi
@@ -277,10 +324,10 @@ enum ProceduralSky {
                 color += sunColor * sun
 
                 let base = (y * width + x) * 4
-                pixels[base + 0] = Float16(color.x).bitPattern
-                pixels[base + 1] = Float16(color.y).bitPattern
-                pixels[base + 2] = Float16(color.z).bitPattern
-                pixels[base + 3] = Float16(1).bitPattern
+                pixels[base + 0] = Float16(color.x)
+                pixels[base + 1] = Float16(color.y)
+                pixels[base + 2] = Float16(color.z)
+                pixels[base + 3] = 1
             }
         }
 
@@ -288,7 +335,7 @@ enum ProceduralSky {
             texture.replace(region: MTLRegionMake2D(0, 0, width, height),
                             mipmapLevel: 0,
                             withBytes: raw.baseAddress!,
-                            bytesPerRow: width * 4 * MemoryLayout<UInt16>.size)
+                            bytesPerRow: width * 4 * MemoryLayout<Float16>.size)
         }
         return texture
     }

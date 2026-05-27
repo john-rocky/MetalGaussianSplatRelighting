@@ -1,38 +1,69 @@
-# MetalSplatter
-Render 3D Gaussian Splats using Metal on Apple platforms (iOS/iPhone/iPad, macOS, and visionOS/Vision Pro)
+# Metal Gaussian Splat Relighting
 
-![A greek-style bust of a woman made of metal, wearing aviator-style goggles while gazing toward colorful abstract metallic blobs floating in space](http://metalsplatter.com/hero.640.jpg)
+**Real-time relightable 3D Gaussian Splatting on Apple platforms, in Swift + Metal.**
 
-This is a Swift/Metal library for rendering scenes captured via the techniques described in [3D Gaussian Splatting for Real-Time Radiance Field Rendering](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/). It will let you load up a PLY/SPZ/.splat and visualize it on iOS, macOS, and visionOS (using amplification for rendering in stereo on Vision Pro). Modules include
-* MetalSplatter, the core library to render a frame
-* PLYIO, for reading and writing binary or ASCII PLY files; this is standalone, feel free to use it if you just have a hankering to load up some PLY files for some reason.
-* SplatIO, a thin layer on top of PLYIO to interpret these PLY files (as well as .splat files) as sets of splats
-* SampleApp, a mini app to demonstrate how to use the above (based on Apple template code) -- don't expect much, it's intentionally minimal, just an illustration
-* SampleBoxRenderer, a drop-in replacement for MetalSplatter for debugging integration, which just renders the cube from Apple Metal template
+Load a [Ref-Gaussian](https://github.com/fudan-zvg/ref-gaussian)–trained scene and relight it live on an
+iPhone: swap and rotate the HDR environment and watch the reflections and shading respond, with the
+environment drawn behind the object as a skybox. Built on top of
+[scier/MetalSplatter](https://github.com/scier/MetalSplatter) (which renders splats but does not relight),
+this fork adds a full **split-sum image-based-lighting (IBL)** pipeline and **deferred physically-based
+shading** for relightable assets.
 
-## Getting Started
+> Status: research/portfolio project. The relighting algorithms are from published work (Ref-Gaussian,
+> UE4 split-sum IBL); the contribution here is porting and optimizing them into a real-time on-device
+> Metal pipeline.
 
-You're right, the documentation is entirely missing; it's a major TODO list item. In the meantime, feel free to try out the sample app -- just, like I said, don't expect much.
+## What it adds over MetalSplatter
 
-1. Get yourself a gaussian splat PLY (or spz or .splat) file (see Resources below)
-2. Clone the repo and open SampleApp/MetalSplatter_SampleApp.xcodeproj
-3. If you want to run on iOS/visionOS, select your target and set your development team and bundle ID in Signing & Capabilities. On macOS, just have at it.
-4. Make sure your scheme is set to Release mode. Loading large files in Debug is more than an order of magnitude slower.
-5. Run
-6. Note: framerate will be better if you run without the debugger attached (hit Stop in Xcode, and go run from the app from the Home screen)
+- **Split-sum IBL relighting** — GPU-precomputed prefiltered specular cubemap + diffuse irradiance
+  cubemap + BRDF (DFG) integration LUT, evaluated per pixel.
+- **Deferred PBR shading** — per-splat material (normal / roughness / reflection strength / albedo) is
+  blended into a tile-memory G-buffer, then shaded once per pixel. This matches Ref-Gaussian's
+  `render_surfel`: `final = (1 − reflectance)·base_color + specular`, with the specular F0 tinted by the
+  learned `ori_color` albedo.
+- **HDR environment + skybox** — load an equirectangular HDR; it lights the object *and* is drawn as the
+  background (reconstructed per pixel from the inverse view-projection), so reflections match the scene
+  behind the object. Switch between bundled environments and rotate them live.
+- **Ref-Gaussian 2D-surfel assets** — SplatIO reads the non-standard 281-float `.ply` (per-splat PBR
+  material, surfel normal reconstructed from the rotation quaternion).
+- **Interactive orbit camera** — drag to rotate, pinch to zoom, with a Z-up→Y-up calibration for
+  Ref-NeRF / Blender datasets.
 
-## Showcase: apps and projects using MetalSplatter
+## How it works
 
-* The [MetalSplatter viewer](https://apps.apple.com/us/app/metalsplatter/id6476895334) is a simple, official Vision Pro app based on this library. This is different from the minimal included sample app (for instance, it has camera controls and a splat gallery). Confusingly, both the (open source) library and (non-open-source) app are called MetalSplatter, and both are by [scier](https://github.com/scier).
+```
+Ref-Gaussian .ply ──▶ SplatIO ──▶ per-splat material (N, roughness, reflectance, albedo)
+                                        │
+HDR equirect ──▶ IBL precompute ──▶ prefiltered cube + irradiance cube + BRDF LUT
+                                        │
+                          ┌─────────────┴───────────────┐
+                          ▼                              ▼
+              multi-stage G-buffer pass         postprocess pass
+           (blend color/normal/material      (per-pixel split-sum IBL +
+            into tile imageblock memory)       skybox composite)
+```
 
-* [OverSoul](https://apps.apple.com/app/id6475262918) for Vision Pro: "Capture, share, and interact with spatial photos, 3D models and immersive spaces in a vibrant social ecosystem designed for the next generation of spatial computing"
+Reflections and the skybox sample the same environment in a single consistent frame, so they always
+agree. Normals are oriented per-pixel toward the camera (matching Ref-Gaussian's `flip_align_view`).
 
-* Know of another project using MetalSplatter? Let us know!
+## Build & run
 
-## Resources
+1. Open `SampleApp/MetalSplatter_SampleApp.xcodeproj`.
+2. For iOS, set your development team and bundle ID under Signing & Capabilities.
+3. Build & run (Release recommended; large files load far faster than in Debug).
+4. Open a Ref-Gaussian `.ply`. Use the on-screen panel to toggle relighting, swap/rotate the
+   environment, adjust intensity, and inspect debug channels (normal / roughness / reflectance /
+   albedo / prefiltered env / irradiance).
 
-* Looking for 3DGS files? Here are a few suggestions:
-   * Capture your own by using a camera or drone, then use [Nerfstudio](https://docs.nerf.studio/nerfology/methods/splat.html) to train the splat
-   * Use the [scene data from the original paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
-* [RadianceFields.com](https://radiancefields.com) is a great source to track news and articles about 3DGS, NeRFs, and related technology and tools (for instance [news about MetalSplatter](https://radiancefields.com/platforms/metalsplatter])), and the community surrounding it
-* [MrNeRF's Awesome 3D Gaussian Splatting Resources](https://github.com/MrNeRF/awesome-3D-gaussian-splatting) is exactly what it says on the label - in particular, an exhaustive and frequently-updated list of 3DGS-related research
+A reflective object (e.g. the Shiny-Blender `car` or a chrome sphere) shows the relighting best; a matte
+object intentionally reflects very little.
+
+## Credits & license
+
+- Built on [scier/MetalSplatter](https://github.com/scier/MetalSplatter) (MIT). The original library,
+  PLYIO, SplatIO, and sample-app scaffolding are by [Sean Cier](https://github.com/scier).
+- Relighting model from [Ref-Gaussian](https://github.com/fudan-zvg/ref-gaussian); split-sum IBL from
+  Karis / Epic Games (UE4).
+- Bundled HDR environments from [Poly Haven](https://polyhaven.com) (CC0).
+
+Licensed under the MIT License (see [LICENSE](LICENSE)), preserving the upstream copyright.

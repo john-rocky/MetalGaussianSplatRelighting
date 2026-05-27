@@ -13,8 +13,40 @@ struct MetalKitSceneView: ViewRepresentable {
     var modelIdentifier: ModelIdentifier?
     var relightControls: RelightControls? = nil
 
-    class Coordinator {
+    // Gesture callbacks are delivered on the main thread, and the renderer is @MainActor, so the
+    // coordinator is main-actor isolated too (required under Swift 6 strict concurrency).
+    @MainActor
+    class Coordinator: NSObject {
         var renderer: MetalKitSceneRenderer?
+        private var panLastTranslation: CGPoint = .zero
+        private var pinchReferenceDistance: Float = Constants.cameraInitialDistance
+
+#if os(iOS)
+        @objc func handlePan(_ g: UIPanGestureRecognizer) {
+            let t = g.translation(in: g.view)
+            if g.state == .began { panLastTranslation = .zero }
+            renderer?.orbitBy(dx: Float(t.x - panLastTranslation.x),
+                              dy: Float(t.y - panLastTranslation.y))
+            panLastTranslation = t
+        }
+        @objc func handlePinch(_ g: UIPinchGestureRecognizer) {
+            if g.state == .began { pinchReferenceDistance = renderer?.cameraDistance ?? Constants.cameraInitialDistance }
+            renderer?.zoomBy(scale: Float(g.scale), referenceDistance: pinchReferenceDistance)
+        }
+#elseif os(macOS)
+        @objc func handlePan(_ g: NSPanGestureRecognizer) {
+            let t = g.translation(in: g.view)
+            if g.state == .began { panLastTranslation = .zero }
+            // AppKit's y axis is up-positive; negate to match the iOS drag feel.
+            renderer?.orbitBy(dx: Float(t.x - panLastTranslation.x),
+                              dy: Float(-(t.y - panLastTranslation.y)))
+            panLastTranslation = t
+        }
+        @objc func handleMagnify(_ g: NSMagnificationGestureRecognizer) {
+            if g.state == .began { pinchReferenceDistance = renderer?.cameraDistance ?? Constants.cameraInitialDistance }
+            renderer?.zoomBy(scale: Float(1 + g.magnification), referenceDistance: pinchReferenceDistance)
+        }
+#endif
     }
 
     func makeCoordinator() -> Coordinator {
@@ -42,6 +74,15 @@ struct MetalKitSceneView: ViewRepresentable {
         renderer?.relightControls = relightControls
         coordinator.renderer = renderer
         metalKitView.delegate = renderer
+
+        // Interactive orbit camera: drag to rotate, pinch to zoom.
+#if os(iOS)
+        metalKitView.addGestureRecognizer(UIPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePan(_:))))
+        metalKitView.addGestureRecognizer(UIPinchGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePinch(_:))))
+#elseif os(macOS)
+        metalKitView.addGestureRecognizer(NSPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePan(_:))))
+        metalKitView.addGestureRecognizer(NSMagnificationGestureRecognizer(target: coordinator, action: #selector(Coordinator.handleMagnify(_:))))
+#endif
 
         Task {
             do {
