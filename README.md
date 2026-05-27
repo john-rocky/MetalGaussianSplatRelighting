@@ -2,7 +2,9 @@
 
 **Real-time relightable 3D Gaussian Splatting on Apple platforms, in Swift + Metal.**
 
-https://github.com/user-attachments/assets/c34f552e-cc8b-47aa-bbb9-c10583419a7e
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/c34f552e-cc8b-47aa-bbb9-c10583419a7e" width="300" alt="Live relighting: rotating the HDR environment and the reflections respond on-device">
+</p>
 
 Load a [Ref-Gaussian](https://github.com/fudan-zvg/ref-gaussian)–trained scene and relight it live on an
 iPhone: swap and rotate the HDR environment and watch the reflections and shading respond, with the
