@@ -32,6 +32,11 @@ struct MetalKitSceneView: ViewRepresentable {
             if g.state == .began { renderer?.pinchBegan() }
             renderer?.zoomBy(scale: Float(g.scale))
         }
+        @objc func handleTap(_ g: UITapGestureRecognizer) {
+            guard let view = g.view, view.bounds.width > 0, view.bounds.height > 0 else { return }
+            let p = g.location(in: view)
+            renderer?.placeAt(normalizedPoint: CGPoint(x: p.x / view.bounds.width, y: p.y / view.bounds.height))
+        }
 #elseif os(macOS)
         @objc func handlePan(_ g: NSPanGestureRecognizer) {
             let t = g.translation(in: g.view)
@@ -78,6 +83,7 @@ struct MetalKitSceneView: ViewRepresentable {
 #if os(iOS)
         metalKitView.addGestureRecognizer(UIPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePan(_:))))
         metalKitView.addGestureRecognizer(UIPinchGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePinch(_:))))
+        metalKitView.addGestureRecognizer(UITapGestureRecognizer(target: coordinator, action: #selector(Coordinator.handleTap(_:))))
 #elseif os(macOS)
         metalKitView.addGestureRecognizer(NSPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePan(_:))))
         metalKitView.addGestureRecognizer(NSMagnificationGestureRecognizer(target: coordinator, action: #selector(Coordinator.handleMagnify(_:))))

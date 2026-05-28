@@ -63,20 +63,21 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         try? CameraBackgroundConverter(device: device, colorFormat: sceneColorFormat)
     private var cameraTextureCache: CVMetalTextureCache?
     private var arBackgroundTexture: MTLTexture?
-    /// World transform where the model is anchored in AR, set once when tracking is first available.
-    private var arModelAnchor: matrix_float4x4?
-    /// Placement distance (meters) ahead of the camera when the model is first anchored in AR.
-    private static let arModelDistance: Float = 1.2
+    /// Where the model sits in the world: a point on a detected horizontal plane (floor/table) found
+    /// by raycast. nil until placed — the model is hidden (camera only) until then.
+    private var arFloorPosition: SIMD3<Float>?
+    /// Model-space -> normalized transform (Z-up→Y-up, base on y=0, centered in XZ, longest footprint
+    /// = 1 unit), built once from the loaded model's bounds so the real-meter scale is life-size.
+    private var arModelNormalize: matrix_float4x4 = matrix_identity_float4x4
 
-    /// User manipulation of the AR-anchored model, analogous to the orbit camera: pinch scales it,
-    /// drag yaws/pitches it. `arActive` mirrors draw()'s AR state so the gesture handlers target the
-    /// model instead of the orbit camera. Reset when AR is left (the model is re-placed on re-entry).
+    /// User manipulation of the placed model: drag yaws it (turntable), pinch sets its real-world size.
+    /// `arActive` mirrors draw()'s AR state so the gesture handlers target the model, not the orbit camera.
     private var arActive = false
     private var arModelYaw: Angle = .zero
-    private var arModelPitch: Angle = .zero
-    private var arModelScale: Float = 0.4
-    private var pinchReferenceScale: Float = 0.4
-    private static let arModelScaleRange: ClosedRange<Float> = 0.05...3.0
+    /// Real-world size of the model in meters (its longest footprint dimension). Default ≈ a car length.
+    private var arModelLengthMeters: Float = 4.5
+    private var pinchReferenceLength: Float = 4.5
+    private static let arModelLengthRange: ClosedRange<Float> = 0.3...15.0
 #endif
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
@@ -103,9 +104,9 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     func orbitBy(dx: Float, dy: Float) {
 #if os(iOS)
         if arActive {
+            // Grounded car: horizontal drag spins it on the floor (yaw); vertical drag is ignored so
+            // it can't tilt into/through the ground.
             arModelYaw += Angle(radians: Double(dx * Constants.cameraOrbitRadiansPerPoint))
-            let pitch = arModelPitch.radians + Double(dy * Constants.cameraOrbitRadiansPerPoint)
-            arModelPitch = Angle(radians: min(max(pitch, -Constants.cameraPitchLimit.radians), Constants.cameraPitchLimit.radians))
             return
         }
 #endif
@@ -115,27 +116,37 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         cameraPitch = Angle(radians: min(max(newPitch, -Constants.cameraPitchLimit.radians), Constants.cameraPitchLimit.radians))
     }
 
-    /// Snapshots the pinch target (orbit distance + AR model scale) at gesture start, so the
+    /// Snapshots the pinch target (orbit distance + AR model real size) at gesture start, so the
     /// cumulative gesture scale in `zoomBy` maps relative to it.
     func pinchBegan() {
         pinchReferenceDistance = cameraDistance
 #if os(iOS)
-        pinchReferenceScale = arModelScale
+        pinchReferenceLength = arModelLengthMeters
 #endif
     }
 
-    /// Apply a pinch: in AR it scales the anchored model, otherwise it dollies the orbit camera.
-    /// `scale` is the gesture's cumulative scale relative to the `pinchBegan` snapshot.
+    /// Apply a pinch: in AR it resizes the placed model (real-world meters), otherwise it dollies the
+    /// orbit camera. `scale` is the gesture's cumulative scale relative to the `pinchBegan` snapshot.
     func zoomBy(scale: Float) {
 #if os(iOS)
         if arActive {
-            arModelScale = min(max(pinchReferenceScale * scale, Self.arModelScaleRange.lowerBound),
-                               Self.arModelScaleRange.upperBound)
+            arModelLengthMeters = min(max(pinchReferenceLength * scale, Self.arModelLengthRange.lowerBound),
+                                      Self.arModelLengthRange.upperBound)
             return
         }
 #endif
         userHasInteracted = true
         cameraDistance = min(max(pinchReferenceDistance / max(scale, 0.0001), Constants.cameraMinDistance), Constants.cameraMaxDistance)
+    }
+
+    /// Places (or moves) the model onto the floor under a normalized screen point (0...1, top-left).
+    /// Used by tap-to-place; auto-placement uses the screen center each frame until first placed.
+    func placeAt(normalizedPoint: CGPoint) {
+#if os(iOS)
+        guard relightControls?.environmentChoice == .arRoom,
+              let frame = arProbeProvider?.currentFrame else { return }
+        _ = tryPlaceOnFloor(normalizedPoint: normalizedPoint, frame: frame)
+#endif
     }
 
     init?(_ metalKitView: MTKView) {
@@ -167,6 +178,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                           maxSimultaneousRenders: Constants.maxSimultaneousRenders)
             let reader = try AutodetectSceneReader(url)
             let points = try await reader.readAll()
+#if os(iOS)
+            // Robust model bounds (rejecting floater outliers) -> a normalize transform so the model
+            // can be placed life-size on the floor in AR.
+            arModelNormalize = Self.normalizeMatrix(for: Self.robustModelBounds(points))
+#endif
             let chunk = try SplatChunk(device: device, from: points)
             await splat.addChunk(chunk)
             // The IBL environment (default: bundled studio HDR) is built lazily on the first render
@@ -318,15 +334,23 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         if relightControls?.environmentChoice == .arRoom {
             arFrame = arProbeProvider?.currentFrame
         }
-        if let arFrame,
-           let arVP = arViewport(for: arFrame, drawableSize: CGSize(width: drawableTexture.width,
-                                                                    height: drawableTexture.height)),
-           let splat,
-           let background = prepareARBackground(frame: arFrame, drawableTexture: drawableTexture,
-                                                commandBuffer: commandBuffer) {
-            activeViewport = arVP
-            splat.arBackgroundTexture = background
-            arActive = true
+        if let arFrame {
+            // Auto-place on the floor under the screen center until the user has a placement; after
+            // that, tap-to-place (placeAt) moves it. The model stays hidden until a floor is found.
+            if arFloorPosition == nil {
+                _ = tryPlaceOnFloor(normalizedPoint: CGPoint(x: 0.5, y: 0.5), frame: arFrame)
+            }
+            if let arVP = arViewport(for: arFrame, drawableSize: CGSize(width: drawableTexture.width,
+                                                                        height: drawableTexture.height)),
+               let splat,
+               let background = prepareARBackground(frame: arFrame, drawableTexture: drawableTexture,
+                                                    commandBuffer: commandBuffer) {
+                activeViewport = arVP
+                splat.arBackgroundTexture = background
+                arActive = true
+            } else {
+                splat?.arBackgroundTexture = nil
+            }
         } else {
             splat?.arBackgroundTexture = nil
         }
@@ -405,12 +429,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             return
         }
         // Switching away from AR/Room: pause the session so the camera isn't left running, and drop
-        // the world anchor + user manipulation so the model is re-placed fresh if AR is re-entered.
+        // the placement + user manipulation so the model is re-placed fresh if AR is re-entered.
         arProbeProvider?.stop()
-        arModelAnchor = nil
+        arFloorPosition = nil
         arModelYaw = .zero
-        arModelPitch = .zero
-        arModelScale = 0.4
+        arModelLengthMeters = 4.5
         arActive = false
 #endif
         if let cached = environmentCache[choice] {
@@ -457,39 +480,24 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         provider.start()
     }
 
-    /// Builds the AR viewport from the current ARCamera: world->camera view + ARKit projection (both
-    /// oriented for the interface), with the model placed at a fixed world anchor (scaled, Z-up->Y-up).
-    /// Returns nil until tracking is usable, so the model isn't anchored from a bad pose.
+    /// Builds the AR viewport from the current ARCamera (world->camera view + ARKit projection, both
+    /// oriented for the interface). The model is normalized to life-size, placed on the detected floor
+    /// (`arFloorPosition`), sized in meters, and yawed by the user. Returns nil until placed/tracking.
     private func arViewport(for frame: ARFrame, drawableSize: CGSize) -> ModelRendererViewportDescriptor? {
         guard drawableSize.width > 0, drawableSize.height > 0 else { return nil }
+        guard let floor = arFloorPosition else { return nil }   // not placed on the floor yet
         if case .notAvailable = frame.camera.trackingState { return nil }
         let camera = frame.camera
         let orientation = currentInterfaceOrientation()
 
-        // Place the model once: a fixed distance ahead of the initial camera, at eye height and
-        // world-axis-aligned (upright regardless of how the device was tilted when AR started).
-        if arModelAnchor == nil {
-            let transform = camera.transform
-            var forward = -SIMD3<Float>(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
-            forward.y = 0
-            let length = simd_length(forward)
-            forward = length > 1e-4 ? forward / length : SIMD3<Float>(0, 0, -1)
-            let origin = SIMD3<Float>(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
-            let position = origin + forward * Self.arModelDistance
-            var anchor = matrix_identity_float4x4
-            anchor.columns.3 = SIMD4<Float>(position, 1)
-            arModelAnchor = anchor
-        }
-        guard let anchor = arModelAnchor else { return nil }
-
         let viewWorld = camera.viewMatrix(for: orientation)   // world -> camera
         let projection = camera.projectionMatrix(for: orientation, viewportSize: drawableSize,
                                                   zNear: 0.01, zFar: 100)
-        let upCalibration = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
-        // User manipulation at the anchor: drag = yaw (about world up) + pitch, pinch = scale.
+        // Place the normalized model (base-centered on its own origin) on the floor point, size it in
+        // real meters, and spin it by the user's yaw. arModelNormalize already maps Z-up->Y-up.
+        let floorAnchor = matrix4x4_translation(floor.x, floor.y, floor.z)
         let yaw = matrix4x4_rotation(radians: Float(arModelYaw.radians), axis: SIMD3<Float>(0, 1, 0))
-        let pitch = matrix4x4_rotation(radians: Float(arModelPitch.radians), axis: SIMD3<Float>(1, 0, 0))
-        let modelWorld = anchor * yaw * pitch * matrix4x4_scale(arModelScale) * upCalibration
+        let modelWorld = floorAnchor * yaw * matrix4x4_scale(arModelLengthMeters) * arModelNormalize
         let viewMatrix = viewWorld * modelWorld
 
         let mtlViewport = MTLViewport(originX: 0, originY: 0,
@@ -499,6 +507,70 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                projectionMatrix: projection,
                                                viewMatrix: viewMatrix,
                                                screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
+    }
+
+    /// Raycasts a world ray through a normalized screen point against detected/estimated horizontal
+    /// planes; on a hit, sets `arFloorPosition` to that floor point. Returns whether it placed.
+    private func tryPlaceOnFloor(normalizedPoint: CGPoint, frame: ARFrame) -> Bool {
+        guard let session = arProbeProvider?.arSession, drawableSize.width > 0, drawableSize.height > 0 else { return false }
+        if case .notAvailable = frame.camera.trackingState { return false }
+        let orientation = currentInterfaceOrientation()
+        let view = frame.camera.viewMatrix(for: orientation)
+        let projection = frame.camera.projectionMatrix(for: orientation, viewportSize: drawableSize,
+                                                       zNear: 0.01, zFar: 100)
+        let invVP = (projection * view).inverse
+        let ndcX = Float(normalizedPoint.x) * 2 - 1
+        let ndcY = 1 - Float(normalizedPoint.y) * 2
+        let nearH = invVP * SIMD4<Float>(ndcX, ndcY, 0, 1)   // Metal NDC near z = 0
+        let farH  = invVP * SIMD4<Float>(ndcX, ndcY, 1, 1)   //            far  z = 1
+        let near = SIMD3<Float>(nearH.x, nearH.y, nearH.z) / nearH.w
+        let far  = SIMD3<Float>(farH.x, farH.y, farH.z) / farH.w
+        let direction = simd_normalize(far - near)
+        let query = ARRaycastQuery(origin: near, direction: direction,
+                                   allowing: .estimatedPlane, alignment: .horizontal)
+        guard let hit = session.raycast(query).first else { return false }
+        let t = hit.worldTransform
+        arFloorPosition = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        return true
+    }
+
+    /// Outlier-robust model bounds (mean ± 3σ filter) in model space, for life-size AR placement —
+    /// rejects scene-sized floater splats that would otherwise blow up the bounding box.
+    private static func robustModelBounds(_ points: [SplatPoint]) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
+        guard !points.isEmpty else { return (SIMD3<Float>(repeating: -1), SIMD3<Float>(repeating: 1)) }
+        let count = Float(points.count)
+        var mean = SIMD3<Float>(repeating: 0)
+        for p in points { mean += p.position }
+        mean /= count
+        var variance = SIMD3<Float>(repeating: 0)
+        for p in points { let d = p.position - mean; variance += d * d }
+        variance /= count
+        let sigma = SIMD3<Float>(variance.x.squareRoot(), variance.y.squareRoot(), variance.z.squareRoot())
+        let lo = mean - 3 * sigma
+        let hi = mean + 3 * sigma
+        var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var mx = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for p in points {
+            let q = p.position
+            if q.x < lo.x || q.x > hi.x || q.y < lo.y || q.y > hi.y || q.z < lo.z || q.z > hi.z { continue }
+            mn = simd_min(mn, q); mx = simd_max(mx, q)
+        }
+        return mn.x <= mx.x ? (mn, mx) : (lo, hi)
+    }
+
+    /// Builds the model-space -> normalized transform: Z-up→Y-up, base resting on y=0, centered in XZ,
+    /// and the longest footprint dimension scaled to 1 unit (so `arModelLengthMeters` reads as meters).
+    private static func normalizeMatrix(for bounds: (min: SIMD3<Float>, max: SIMD3<Float>)) -> matrix_float4x4 {
+        let r = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))   // Z-up -> Y-up
+        // AABB after r maps model (x,y,z) -> world' (x, z, -y).
+        let mn = bounds.min, mx = bounds.max
+        let xMin = mn.x, xMax = mx.x        // world' x
+        let yMin = mn.z, yMax = mx.z        // world' y (= model z)
+        let zMin = -mx.y, zMax = -mn.y      // world' z (= -model y)
+        let horizontal = max(xMax - xMin, zMax - zMin)
+        let normScale = horizontal > 1e-5 ? 1.0 / horizontal : 1.0
+        let translate = matrix4x4_translation(-(xMin + xMax) * 0.5, -yMin, -(zMin + zMax) * 0.5)
+        return matrix4x4_scale(normScale) * translate * r
     }
 
     private func currentInterfaceOrientation() -> UIInterfaceOrientation {
@@ -817,11 +889,14 @@ final class ARRoomProbeProvider: NSObject, ARSessionDelegate {
 
     /// The latest ARKit frame (camera pose + captured image), read by the renderer each draw for full AR.
     var currentFrame: ARFrame? { session.currentFrame }
+    /// The underlying session, exposed so the renderer can raycast against detected planes for placement.
+    var arSession: ARSession { session }
 
     func start() {
         guard Self.isSupported, !isRunning else { return }
         let configuration = ARWorldTrackingConfiguration()
         configuration.environmentTexturing = .automatic
+        configuration.planeDetection = [.horizontal]   // floor/table detection for placing the model
         session.delegate = self
         session.run(configuration)
         isRunning = true

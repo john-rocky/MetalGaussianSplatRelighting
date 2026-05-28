@@ -30,8 +30,9 @@ shading** for relightable assets.
   background (reconstructed per pixel from the inverse view-projection), so reflections match the scene
   behind the object. Switch between bundled environments and rotate them live.
 - **AR mode** — place the relit splat in your real room with ARKit: the live camera feed is the
-  background, the object is lit by (and reflects) the room via ARKit environment probes, and it stays
-  world-anchored as you move the device around it. Pinch to scale and drag to rotate it in place.
+  background, the object is lit by (and reflects) the room via ARKit environment probes, and it sits on
+  the detected floor at **real-world scale** so you can walk around it. Tap to place, pinch to resize,
+  drag to spin.
 - **Ref-Gaussian 2D-surfel assets** — SplatIO reads the non-standard 281-float `.ply` (per-splat PBR
   material, surfel normal reconstructed from the rotation quaternion).
 - **Interactive orbit camera** — drag to rotate, pinch to zoom, with a Z-up→Y-up calibration for
@@ -63,8 +64,10 @@ reuses the same deferred-relighting pipeline:
   straight into the IBL precompute — so the object is lit by, and reflects, your actual room.
 - The captured camera frame (YCbCr) is converted to a linear-RGB background and composited *in the same
   resolve pass* that normally draws the skybox — splats sit over the live camera with no extra blend.
-- The model is world-anchored a fixed distance ahead at placement and viewed through the `ARCamera`
-  view/projection, so it holds its place as you walk around it; pinch scales and drag rotates it.
+- The model is placed on a detected horizontal plane by raycast (auto under the screen center, or
+  tap-to-place) and viewed through the `ARCamera` view/projection, so it holds its spot on the floor as
+  you walk around it. It is normalized from its (outlier-robust) bounds and scaled to a real-world size
+  in meters, so it appears life-size; pinch resizes and drag spins it.
 
 A note on correctness: a single rear camera only sees its frustum, so reflections of directions behind
 the camera can't be measured — ARKit fills those in with machine-learning estimation. This reads well on
@@ -79,7 +82,8 @@ glossy/rough materials (the reflection is blurred anyway) and improves as you lo
    environment, adjust intensity, and inspect debug channels (normal / roughness / reflectance /
    albedo / prefiltered env / irradiance).
 5. Pick the **AR / Room** environment to place the object in your real room (the app requests camera
-   access). Move the device to look around it; pinch to scale and drag to rotate. Keep relighting on.
+   access). Point at the floor so it drops in at real size (or tap to place), then walk around it;
+   pinch to resize and drag to spin. Keep relighting on. Life-size objects need open space.
 
 A reflective object (e.g. the Shiny-Blender `car` or a chrome sphere) shows the relighting best; a matte
 object intentionally reflects very little.
