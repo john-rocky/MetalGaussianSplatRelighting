@@ -87,7 +87,9 @@ typedef struct
     float reflectionStrengthOverride;     // >= 0 overrides per-splat reflection strength
     vector_float2 screenSize;             // render-target size in pixels (skybox ray reconstruction)
     uint arBackground;                    // 1 = composite over the AR camera image (texture 4) instead of the skybox
-    uint _arPadding;                      // keep 16-byte struct tail explicit
+    uint _pad0;                           // padding
+    vector_float2 _pad1;                  // padding (align the tint vector to 16 bytes)
+    vector_float4 tint;                   // configurator repaint: xyz = paint color (linear), w = strength (0 = original)
 } RelightUniforms;
 
 // Keep in sync with EncodedSplatPoint

@@ -392,6 +392,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             settings.roughnessOverride = controls.useTrainedMaterial ? -1 : Float(controls.roughness)
             settings.reflectionStrengthOverride = controls.useTrainedMaterial ? -1 : Float(controls.reflectionStrength)
             settings.arBackground = arActive   // composite over the live camera instead of the skybox
+            settings.tintColor = controls.tintColor
+            settings.tintStrength = Float(controls.tintStrength)
             splat.relightSettings = settings
         }
 
@@ -712,6 +714,9 @@ final class RelightControls {
     var roughness: Double = 0.4
     /// Global reflection-strength override (0...1).
     var reflectionStrength: Double = 0.5
+    /// Configurator repaint: paint color (linear RGB) and strength (0 = original color, 1 = full repaint).
+    var tintColor: SIMD3<Float> = SIMD3(1, 1, 1)
+    var tintStrength: Double = 0
     /// Scales the sampled environment radiance.
     var environmentIntensity: Double = 1.0
     /// 0 shaded, 1 normal, 2 roughness, 3 reflectionStrength, 4 prefiltered environment.
@@ -797,6 +802,42 @@ enum ProceduralSky {
     }
 }
 
+/// A selectable paint color for the configurator (nil `linear` restores the original color).
+private struct ConfiguratorPaint: Identifiable {
+    let id = UUID()
+    let name: String
+    let swatch: Color
+    let linear: SIMD3<Float>?
+}
+
+/// A selectable finish for the configurator; drives the roughness / reflection overrides.
+private struct ConfiguratorFinish: Identifiable {
+    let id = UUID()
+    let name: String
+    let trained: Bool
+    let roughness: Double
+    let reflection: Double
+}
+
+private let configuratorPaints: [ConfiguratorPaint] = [
+    .init(name: "Original", swatch: .gray, linear: nil),
+    .init(name: "Red", swatch: .red, linear: SIMD3(0.55, 0.02, 0.02)),
+    .init(name: "Blue", swatch: .blue, linear: SIMD3(0.02, 0.06, 0.5)),
+    .init(name: "Green", swatch: .green, linear: SIMD3(0.03, 0.3, 0.06)),
+    .init(name: "Black", swatch: .black, linear: SIMD3(0.015, 0.015, 0.015)),
+    .init(name: "White", swatch: .white, linear: SIMD3(0.8, 0.8, 0.82)),
+    .init(name: "Silver", swatch: Color(white: 0.75), linear: SIMD3(0.6, 0.6, 0.62)),
+    .init(name: "Yellow", swatch: .yellow, linear: SIMD3(0.6, 0.45, 0.02)),
+]
+
+private let configuratorFinishes: [ConfiguratorFinish] = [
+    .init(name: "Original", trained: true, roughness: 0.4, reflection: 0.5),
+    .init(name: "Matte", trained: false, roughness: 0.9, reflection: 0.05),
+    .init(name: "Glossy", trained: false, roughness: 0.25, reflection: 0.4),
+    .init(name: "Mirror", trained: false, roughness: 0.02, reflection: 0.95),
+    .init(name: "Metallic", trained: false, roughness: 0.15, reflection: 0.9),
+]
+
 /// A compact control panel for the relightable rendering settings.
 struct RelightControlsView: View {
     @Bindable var controls: RelightControls
@@ -843,6 +884,38 @@ struct RelightControlsView: View {
                             if !controls.useTrainedMaterial {
                                 labeledSlider("Roughness", value: $controls.roughness, range: 0...1)
                                 labeledSlider("Reflection", value: $controls.reflectionStrength, range: 0...1)
+                            }
+
+                            // Configurator: repaint color + finish preset ("try your variant in your room").
+                            Text("Configurator").font(.caption.bold())
+                            HStack(spacing: 6) {
+                                ForEach(configuratorPaints) { paint in
+                                    Button {
+                                        if let linear = paint.linear {
+                                            controls.tintColor = linear
+                                            controls.tintStrength = 1
+                                        } else {
+                                            controls.tintStrength = 0
+                                        }
+                                    } label: {
+                                        Circle()
+                                            .fill(paint.swatch)
+                                            .frame(width: 22, height: 22)
+                                            .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            HStack(spacing: 6) {
+                                ForEach(configuratorFinishes) { finish in
+                                    Button(finish.name) {
+                                        controls.useTrainedMaterial = finish.trained
+                                        controls.roughness = finish.roughness
+                                        controls.reflectionStrength = finish.reflection
+                                    }
+                                    .font(.caption2)
+                                    .buttonStyle(.bordered)
+                                }
                             }
 
                             Picker("Debug", selection: $controls.debugMode) {

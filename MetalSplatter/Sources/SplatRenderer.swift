@@ -118,7 +118,9 @@ public final class SplatRenderer: @unchecked Sendable {
         var reflectionStrengthOverride: Float
         var screenSize: SIMD2<Float> = .zero
         var arBackground: UInt32 = 0
-        var _arPadding: UInt32 = 0
+        var _pad0: UInt32 = 0
+        var _pad1: SIMD2<Float> = .zero
+        var tint: SIMD4<Float> = .zero
     }
 
     /// User-facing relightable-rendering settings. Mutate between frames to control IBL.
@@ -135,6 +137,10 @@ public final class SplatRenderer: @unchecked Sendable {
         /// When true, splats composite over `arBackgroundTexture` (the live AR camera image) instead
         /// of the equirect skybox. Requires `arBackgroundTexture` to be set.
         public var arBackground: Bool = false
+        /// Configurator repaint: recolor the model to `tintColor` (linear RGB), preserving shading.
+        /// `tintStrength` 0 = original color, 1 = full repaint.
+        public var tintColor: SIMD3<Float> = SIMD3(1, 1, 1)
+        public var tintStrength: Float = 0
         public init() {}
     }
 
@@ -390,7 +396,8 @@ public final class SplatRenderer: @unchecked Sendable {
                                roughnessOverride: relightSettings.roughnessOverride,
                                reflectionStrengthOverride: relightSettings.reflectionStrengthOverride,
                                screenSize: screenSize,
-                               arBackground: useARBackground ? 1 : 0)
+                               arBackground: useARBackground ? 1 : 0,
+                               tint: SIMD4<Float>(relightSettings.tintColor, relightSettings.tintStrength))
     }
 
     // MARK: - Chunk Management

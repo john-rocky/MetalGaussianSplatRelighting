@@ -193,6 +193,13 @@ half4 resolveRelight(FragmentValues v,
     float invMW = 1.0f / float(mw);
     half3 baseColor = half3(float3(v.color.rgb) * invCov);   // SH-evaluated diffuse base color
     half3 oriColor = half3(float3(v.oriColor.rgb) * invMW);  // Ref-Gaussian albedo / specular F0 tint
+    // Configurator repaint: recolor to the chosen paint while preserving the per-pixel shading
+    // (luminance), so the same captured asset shows in a new color and is still correctly relit.
+    if (relight.tint.w > 0.0f) {
+        const float3 lw = float3(0.2126f, 0.7152f, 0.0722f);
+        baseColor = half3(mix(float3(baseColor), dot(float3(baseColor), lw) * relight.tint.xyz, relight.tint.w));
+        oriColor  = half3(mix(float3(oriColor),  dot(float3(oriColor),  lw) * relight.tint.xyz, relight.tint.w));
+    }
     float3 N = normalize(float3(v.normalRough.rgb));
     float3 V = normalize(float3(v.viewRefl.rgb));
     float roughness = float(v.normalRough.a) * invMW;
