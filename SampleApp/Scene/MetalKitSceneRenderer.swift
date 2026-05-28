@@ -69,6 +69,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     /// Model-space -> normalized transform (Z-up→Y-up, base on y=0, centered in XZ, longest footprint
     /// = 1 unit), built once from the loaded model's bounds so the real-meter scale is life-size.
     private var arModelNormalize: matrix_float4x4 = matrix_identity_float4x4
+    /// Normalized footprint extents (world XZ, longest = 1), used to size the ground contact shadow.
+    private var arModelFootprint: SIMD2<Float> = SIMD2(1, 1)
 
     /// User manipulation of the placed model: drag yaws it (turntable), pinch sets its real-world size.
     /// `arActive` mirrors draw()'s AR state so the gesture handlers target the model, not the orbit camera.
@@ -78,6 +80,13 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var arModelLengthMeters: Float = 4.5
     private var pinchReferenceLength: Float = 4.5
     private static let arModelLengthRange: ClosedRange<Float> = 0.3...15.0
+
+    /// Soft elliptical contact shadow on the floor under the model, so it reads as grounded.
+    private lazy var groundShadowRenderer: GroundShadowRenderer? =
+        try? GroundShadowRenderer(device: device, colorFormat: sceneColorFormat)
+    private static let shadowMargin: Float = 1.15      // ellipse slightly larger than the footprint
+    private static let shadowStrength: Float = 0.55    // peak darkness under the model
+    private static let shadowSoftness: Float = 1.6     // penumbra falloff
 #endif
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
@@ -179,9 +188,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             let reader = try AutodetectSceneReader(url)
             let points = try await reader.readAll()
 #if os(iOS)
-            // Robust model bounds (rejecting floater outliers) -> a normalize transform so the model
-            // can be placed life-size on the floor in AR.
-            arModelNormalize = Self.normalizeMatrix(for: Self.robustModelBounds(points))
+            // Robust model bounds (rejecting floater outliers) -> normalize transform + footprint, so
+            // the model can be placed life-size on the floor in AR with a footprint-sized shadow.
+            let placement = Self.modelPlacement(for: Self.robustModelBounds(points))
+            arModelNormalize = placement.normalize
+            arModelFootprint = placement.footprint
 #endif
             let chunk = try SplatChunk(device: device, from: points)
             await splat.addChunk(chunk)
@@ -345,6 +356,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                let splat,
                let background = prepareARBackground(frame: arFrame, drawableTexture: drawableTexture,
                                                     commandBuffer: commandBuffer) {
+                // Darken the floor under the car (on the camera bg) before the splats composite over it.
+                encodeGroundShadow(frame: arFrame, into: commandBuffer, destination: background)
                 activeViewport = arVP
                 splat.arBackgroundTexture = background
                 arActive = true
@@ -509,6 +522,28 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
     }
 
+    /// Darkens the camera-background floor under the placed model with a soft elliptical contact
+    /// shadow (sized to the model footprint, oriented by yaw, at the floor anchor), so it looks
+    /// grounded. Encoded after the camera conversion and before the splat resolve composites over it.
+    private func encodeGroundShadow(frame: ARFrame, into commandBuffer: MTLCommandBuffer, destination: MTLTexture) {
+        guard let shadow = groundShadowRenderer, let floor = arFloorPosition,
+              drawableSize.width > 0, drawableSize.height > 0 else { return }
+        let orientation = currentInterfaceOrientation()
+        let view = frame.camera.viewMatrix(for: orientation)
+        let projection = frame.camera.projectionMatrix(for: orientation, viewportSize: drawableSize,
+                                                       zNear: 0.01, zFar: 100)
+        let yaw = matrix4x4_rotation(radians: Float(arModelYaw.radians), axis: SIMD3<Float>(0, 1, 0))
+        let semiX = max(arModelFootprint.x, 0.01) * arModelLengthMeters * 0.5 * Self.shadowMargin
+        let semiZ = max(arModelFootprint.y, 0.01) * arModelLengthMeters * 0.5 * Self.shadowMargin
+        let footprintScale = matrix_float4x4(columns: (SIMD4<Float>(semiX, 0, 0, 0),
+                                                       SIMD4<Float>(0, 1, 0, 0),
+                                                       SIMD4<Float>(0, 0, semiZ, 0),
+                                                       SIMD4<Float>(0, 0, 0, 1)))
+        let mvp = projection * view * matrix4x4_translation(floor.x, floor.y, floor.z) * yaw * footprintScale
+        shadow.encode(into: commandBuffer, mvp: mvp,
+                      strength: Self.shadowStrength, softness: Self.shadowSoftness, destination: destination)
+    }
+
     /// Raycasts a world ray through a normalized screen point against detected/estimated horizontal
     /// planes; on a hit, sets `arFloorPosition` to that floor point. Returns whether it placed.
     private func tryPlaceOnFloor(normalizedPoint: CGPoint, frame: ARFrame) -> Bool {
@@ -558,19 +593,24 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         return mn.x <= mx.x ? (mn, mx) : (lo, hi)
     }
 
-    /// Builds the model-space -> normalized transform: Z-up→Y-up, base resting on y=0, centered in XZ,
-    /// and the longest footprint dimension scaled to 1 unit (so `arModelLengthMeters` reads as meters).
-    private static func normalizeMatrix(for bounds: (min: SIMD3<Float>, max: SIMD3<Float>)) -> matrix_float4x4 {
+    /// Builds the model-space -> normalized transform (Z-up→Y-up, base resting on y=0, centered in XZ,
+    /// longest footprint dimension = 1 unit, so `arModelLengthMeters` reads as meters) plus the
+    /// normalized footprint extents (world XZ) used to size the contact shadow.
+    private static func modelPlacement(for bounds: (min: SIMD3<Float>, max: SIMD3<Float>))
+        -> (normalize: matrix_float4x4, footprint: SIMD2<Float>) {
         let r = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))   // Z-up -> Y-up
         // AABB after r maps model (x,y,z) -> world' (x, z, -y).
         let mn = bounds.min, mx = bounds.max
         let xMin = mn.x, xMax = mx.x        // world' x
         let yMin = mn.z, yMax = mx.z        // world' y (= model z)
         let zMin = -mx.y, zMax = -mn.y      // world' z (= -model y)
-        let horizontal = max(xMax - xMin, zMax - zMin)
+        let extX = xMax - xMin
+        let extZ = zMax - zMin
+        let horizontal = max(extX, extZ)
         let normScale = horizontal > 1e-5 ? 1.0 / horizontal : 1.0
         let translate = matrix4x4_translation(-(xMin + xMax) * 0.5, -yMin, -(zMin + zMax) * 0.5)
-        return matrix4x4_scale(normScale) * translate * r
+        let normalize = matrix4x4_scale(normScale) * translate * r
+        return (normalize, SIMD2<Float>(extX * normScale, extZ * normScale))
     }
 
     private func currentInterfaceOrientation() -> UIInterfaceOrientation {

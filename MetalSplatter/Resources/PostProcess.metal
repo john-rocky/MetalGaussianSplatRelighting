@@ -186,3 +186,38 @@ fragment float4 arCameraBackground(PPVertexOut in [[stage_in]],
     float3 lin = select(rgb / 12.92f, pow((rgb + 0.055f) / 1.055f, float3(2.4f)), rgb > 0.04045f);
     return float4(lin, 1.0f);
 }
+
+// MARK: - AR ground contact shadow
+//
+// Darkens the camera-background floor under the AR-placed model with a soft elliptical shadow, so the
+// object reads as resting on the ground instead of floating. Drawn as a unit quad on the y=0 plane,
+// transformed by `mvp` (projection · view · floorAnchor·yaw·footprintScale), alpha-blended over the
+// background. The falloff is radial in the quad's local space, i.e. an ellipse after the footprint scale.
+
+typedef struct {
+    float4x4 mvp;        // floor-quad local (XZ unit quad) -> clip
+    float strength;      // peak darkness at the center (0...1)
+    float softness;      // penumbra falloff exponent (higher = tighter core)
+    float2 _pad;
+} GroundShadowUniforms;
+
+struct GroundShadowVOut {
+    float4 position [[position]];
+    float2 local;        // [-1,1] quad coordinates, for the radial falloff
+};
+
+vertex GroundShadowVOut groundShadowVertex(uint vertexID [[vertex_id]],
+                                           constant GroundShadowUniforms &u [[buffer(0)]]) {
+    float2 c = float2((vertexID & 1) == 0 ? -1.0 : 1.0, (vertexID & 2) == 0 ? -1.0 : 1.0);
+    GroundShadowVOut out;
+    out.position = u.mvp * float4(c.x, 0.0, c.y, 1.0);   // unit quad on the floor (XZ) plane
+    out.local = c;
+    return out;
+}
+
+fragment float4 groundShadowFragment(GroundShadowVOut in [[stage_in]],
+                                     constant GroundShadowUniforms &u [[buffer(0)]]) {
+    float r = length(in.local);                          // 0 center -> 1 at the inscribed ellipse edge
+    float a = pow(saturate(1.0f - r), max(u.softness, 0.01f)) * u.strength;
+    return float4(0.0f, 0.0f, 0.0f, a);                  // black; alpha-blended to darken the floor
+}

@@ -68,6 +68,8 @@ reuses the same deferred-relighting pipeline:
   tap-to-place) and viewed through the `ARCamera` view/projection, so it holds its spot on the floor as
   you walk around it. It is normalized from its (outlier-robust) bounds and scaled to a real-world size
   in meters, so it appears life-size; pinch resizes and drag spins it.
+- A soft elliptical **contact shadow** (sized to the model's footprint) is blended onto the floor under
+  the model before the splats composite over it, so it reads as grounded rather than floating.
 
 A note on correctness: a single rear camera only sees its frustum, so reflections of directions behind
 the camera can't be measured — ARKit fills those in with machine-learning estimation. This reads well on
