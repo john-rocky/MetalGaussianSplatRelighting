@@ -152,6 +152,32 @@ static float3 skyboxColor(float4 fragCoord,
     return environmentEquirect.sample(skySampler, euv).rgb * relight.envIntensity;
 }
 
+// Configurator repaint of one color. For a CHROMATIC target paint we change only the hue (keeping
+// each pixel's brightness and chroma magnitude) and gate by relative saturation, so achromatic detail
+// — white/gray/black markings, glass, tyres, chrome — is left untouched; only the colored body is
+// repainted. For a NEUTRAL target (black/white/silver) we fall back to a value repaint that affects
+// everything (painting the whole car that shade). `tint` is the paint (linear RGB), `strength` 0...1.
+static float3 recolorPreservingValue(float3 c, float3 tint, float3 lw, float strength) {
+    float lum = dot(c, lw);
+    float3 chroma = c - lum;
+    float sat = length(chroma);
+    float relSat = sat / max(lum, 1e-3f);                 // ~ HSV saturation (brightness-independent)
+
+    float tLum = dot(tint, lw);
+    float3 tChroma = tint - tLum;
+    float tSat = length(tChroma);
+    float3 tDir = tSat > 1e-4f ? tChroma / tSat : float3(0.0f);
+
+    float3 neutralRecolor = lum * tint;                    // value repaint (black/white/silver)
+    float3 chromaticRecolor = max(lum + tDir * sat, 0.0f); // hue repaint; preserves achromatic detail
+    float targetChromaticity = smoothstep(0.02f, 0.08f, tSat);
+    float3 recolored = mix(neutralRecolor, chromaticRecolor, targetChromaticity);
+
+    float bodyGate = smoothstep(0.10f, 0.35f, relSat);     // chromatic repaint: only the colored body
+    float gate = mix(1.0f, bodyGate, targetChromaticity);
+    return mix(c, recolored, strength * gate);
+}
+
 // Resolve the blended G-buffer to a final color. With relighting enabled (shaded mode) this runs
 // split-sum IBL per pixel on the camera-facing-averaged normal/material and composites the result
 // over the environment skybox; debug modes keep a transparent background (original behavior).
@@ -193,12 +219,12 @@ half4 resolveRelight(FragmentValues v,
     float invMW = 1.0f / float(mw);
     half3 baseColor = half3(float3(v.color.rgb) * invCov);   // SH-evaluated diffuse base color
     half3 oriColor = half3(float3(v.oriColor.rgb) * invMW);  // Ref-Gaussian albedo / specular F0 tint
-    // Configurator repaint: recolor to the chosen paint while preserving the per-pixel shading
-    // (luminance), so the same captured asset shows in a new color and is still correctly relit.
+    // Configurator repaint: change the body's hue to the chosen paint while preserving the shading and
+    // leaving achromatic detail (white/gray/black markings) untouched. See recolorPreservingValue.
     if (relight.tint.w > 0.0f) {
         const float3 lw = float3(0.2126f, 0.7152f, 0.0722f);
-        baseColor = half3(mix(float3(baseColor), dot(float3(baseColor), lw) * relight.tint.xyz, relight.tint.w));
-        oriColor  = half3(mix(float3(oriColor),  dot(float3(oriColor),  lw) * relight.tint.xyz, relight.tint.w));
+        baseColor = half3(recolorPreservingValue(float3(baseColor), relight.tint.xyz, lw, relight.tint.w));
+        oriColor  = half3(recolorPreservingValue(float3(oriColor),  relight.tint.xyz, lw, relight.tint.w));
     }
     float3 N = normalize(float3(v.normalRough.rgb));
     float3 V = normalize(float3(v.viewRefl.rgb));

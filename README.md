@@ -34,9 +34,10 @@ shading** for relightable assets.
   the detected floor at **real-world scale** (with a soft contact shadow) so you can walk around it.
   Tap to place, pinch to resize, drag to spin.
 - **Live configurator** — repaint the object to a new color and switch its finish (matte / glossy /
-  mirror / metallic). The recolor is luminance-preserving, so the *same captured asset* shows in a new
-  color and is still correctly relit and reflects the environment — something baked-lighting captures
-  can't do. The natural AR-commerce "see the variant you'd buy, in your room" feature.
+  mirror / metallic). The recolor changes only the body's hue (keeping its shading, and leaving white /
+  neutral markings untouched), so the *same captured asset* shows in a new color and is still correctly
+  relit and reflects the environment — something baked-lighting captures can't do. The natural
+  AR-commerce "see the variant you'd buy, in your room" feature.
 - **Ref-Gaussian 2D-surfel assets** — SplatIO reads the non-standard 281-float `.ply` (per-splat PBR
   material, surfel normal reconstructed from the rotation quaternion).
 - **Interactive orbit camera** — drag to rotate, pinch to zoom, with a Z-up→Y-up calibration for
