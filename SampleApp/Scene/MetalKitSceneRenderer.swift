@@ -4,6 +4,7 @@ import Metal
 import MetalKit
 import MetalSplatter
 import Observation
+import QuartzCore
 import os
 import SampleBoxRenderer
 import simd
@@ -19,6 +20,17 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     let metalKitView: MTKView
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
+
+    /// The scene renders into this linear-HDR format; presentation (tonemap/bloom/EDR) is applied
+    /// afterward by `postProcessor`. Keeping the scene in float HDR means relighting highlights are
+    /// not clamped before tonemapping.
+    let sceneColorFormat: MTLPixelFormat = .rgba16Float
+    /// Offscreen linear-HDR target the scene is rendered into, before the presentation pass.
+    private var hdrTexture: MTLTexture?
+    /// Tracks the drawable's currently-applied EDR configuration so it's only reconfigured on change.
+    private var appliedEDR: Bool?
+    /// Final, separate presentation pass (exposure / tonemap / bloom / EDR, or reference passthrough).
+    let postProcessor: PostProcessor
 
     var model: ModelIdentifier?
     var modelRenderer: (any ModelRenderer)?
@@ -63,6 +75,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         self.device = metalKitView.device!
         guard let queue = self.device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
+        guard let postProcessor = try? PostProcessor(device: device) else { return nil }
+        self.postProcessor = postProcessor
         self.metalKitView = metalKitView
         metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float
@@ -79,7 +93,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         switch model {
         case .gaussianSplat(let url):
             let splat = try SplatRenderer(device: device,
-                                          colorFormat: metalKitView.colorPixelFormat,
+                                          colorFormat: sceneColorFormat,
                                           depthFormat: metalKitView.depthStencilPixelFormat,
                                           sampleCount: metalKitView.sampleCount,
                                           maxViewCount: 1,
@@ -94,7 +108,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         case .proceduralSplat:
             let controller = try await ProceduralSplatController(
                 device: device,
-                colorFormat: metalKitView.colorPixelFormat,
+                colorFormat: sceneColorFormat,
                 depthFormat: metalKitView.depthStencilPixelFormat,
                 sampleCount: metalKitView.sampleCount,
                 maxViewCount: 1,
@@ -103,7 +117,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             modelRenderer = controller.splatRenderer
         case .sampleBox:
             modelRenderer = try! SampleBoxRenderer(device: device,
-                                                   colorFormat: metalKitView.colorPixelFormat,
+                                                   colorFormat: sceneColorFormat,
                                                    depthFormat: metalKitView.depthStencilPixelFormat,
                                                    sampleCount: metalKitView.sampleCount,
                                                    maxViewCount: 1,
@@ -148,8 +162,62 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         rotation += Constants.rotationPerSecond * now.timeIntervalSince(lastRotationUpdateTimestamp)
     }
 
+    /// (Re)allocates the offscreen linear-HDR target to match the current drawable size.
+    private func ensureHDRTexture(width: Int, height: Int) {
+        if let texture = hdrTexture, texture.width == width, texture.height == height { return }
+        guard width > 0, height > 0 else { return }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: sceneColorFormat,
+                                                                  width: width,
+                                                                  height: height,
+                                                                  mipmapped: false)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        let texture = device.makeTexture(descriptor: descriptor)
+        texture?.label = "Scene HDR"
+        hdrTexture = texture
+    }
+
+    /// Configures the drawable + layer for SDR (8-bit sRGB) or EDR (float, extended-range linear).
+    /// EDR is what keeps highlights from clamping at 1.0 on capable displays; the post-process
+    /// composite pipeline adapts automatically because it is keyed by the drawable's pixel format.
+    private func configureDrawable(edr: Bool) {
+        let layer = metalKitView.layer as? CAMetalLayer
+        if edr {
+            metalKitView.colorPixelFormat = .rgba16Float
+            layer?.wantsExtendedDynamicRangeContent = true
+            layer?.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+        } else {
+            metalKitView.colorPixelFormat = .bgra8Unorm_srgb
+            layer?.wantsExtendedDynamicRangeContent = false
+            layer?.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        }
+    }
+
+    /// Maps the UI controls to display-only presentation settings for the post-process pass.
+    /// (Stage A① only wires reference mode; exposure / tonemap / bloom / EDR are added in A②–A④.)
+    private var presentationSettings: PostProcessor.Settings {
+        var settings = PostProcessor.Settings()
+        guard let controls = relightControls else { return settings }
+        settings.referenceMode = controls.referenceMode
+        settings.exposure = Float(pow(2.0, controls.exposureEV))
+        settings.tonemap = controls.tonemap
+        settings.bloomEnabled = controls.bloomEnabled
+        settings.bloomThreshold = Float(controls.bloomThreshold)
+        settings.bloomIntensity = Float(controls.bloomIntensity)
+        settings.maxValue = controls.edrEnabled ? Float(controls.edrPeak) : 1.0
+        return settings
+    }
+
     func draw(in view: MTKView) {
         guard let modelRenderer, modelRenderer.isReadyToRender else { return }
+
+        // Reconfigure the drawable for SDR/EDR before acquiring it, when the toggle changes.
+        let wantEDR = relightControls?.edrEnabled ?? false
+        if appliedEDR != wantEDR {
+            configureDrawable(edr: wantEDR)
+            appliedEDR = wantEDR
+        }
+
         guard let drawable = view.currentDrawable else { return }
 
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)
@@ -191,21 +259,37 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             splat.relightSettings = settings
         }
 
+        // Pass 1: render the scene into the offscreen linear-HDR target. Relighting completes here in
+        // linear HDR, untouched by any presentation.
+        let drawableTexture = drawable.texture
+        ensureHDRTexture(width: drawableTexture.width, height: drawableTexture.height)
+
         let didRender: Bool
-        do {
-            didRender = try modelRenderer.render(viewports: [viewport],
-                                                 colorTexture: view.multisampleColorTexture ?? drawable.texture,
-                                                 colorStoreAction: view.multisampleColorTexture == nil ? .store : .multisampleResolve,
-                                                 depthTexture: view.depthStencilTexture,
-                                                 rasterizationRateMap: nil,
-                                                 renderTargetArrayLength: 0,
-                                                 to: commandBuffer)
-        } catch {
-            Self.log.error("Unable to render scene: \(error.localizedDescription)")
+        if let hdr = hdrTexture {
+            do {
+                didRender = try modelRenderer.render(viewports: [viewport],
+                                                     colorTexture: hdr,
+                                                     colorStoreAction: .store,
+                                                     depthTexture: view.depthStencilTexture,
+                                                     rasterizationRateMap: nil,
+                                                     renderTargetArrayLength: 0,
+                                                     to: commandBuffer)
+            } catch {
+                Self.log.error("Unable to render scene: \(error.localizedDescription)")
+                didRender = false
+            }
+        } else {
             didRender = false
         }
 
-        if didRender {
+        // Pass 2: single, separate presentation pass (linear HDR -> drawable). Reference mode and
+        // every debug view bypass it for an exact copy.
+        if didRender, let hdr = hdrTexture {
+            postProcessor.encode(into: commandBuffer,
+                                 source: hdr,
+                                 destination: drawableTexture,
+                                 debugMode: UInt32(relightControls?.debugMode ?? 0),
+                                 settings: presentationSettings)
             commandBuffer.present(drawable)
         }
 
@@ -280,6 +364,26 @@ final class RelightControls {
     var environmentIntensity: Double = 1.0
     /// 0 shaded, 1 normal, 2 roughness, 3 reflectionStrength, 4 prefiltered environment.
     var debugMode: Int = 0
+
+    // MARK: Presentation (display-only post-process; never affects linear-HDR relighting)
+    /// When true, bypass all presentation so the render matches the official Ref-Gaussian renderer
+    /// numerically. Turn off (default) to enable exposure / tonemap / bloom / EDR.
+    var referenceMode: Bool = false
+    /// Exposure in stops (EV); applied as a linear 2^EV multiplier before tonemapping.
+    var exposureEV: Double = 0
+    /// Filmic tonemap operator applied to the composited linear-HDR image.
+    var tonemap: PostProcessor.Tonemap = .aces
+    /// HDR bloom (bright-pass + separable blur), added in linear HDR before tonemapping.
+    var bloomEnabled: Bool = false
+    /// Linear-HDR luminance above which pixels contribute to bloom.
+    var bloomThreshold: Double = 1.0
+    /// How strongly the blurred bloom is added back to the image.
+    var bloomIntensity: Double = 0.4
+    /// Output to an extended-dynamic-range drawable (rgba16Float + extended-linear colorspace) so
+    /// highlights above 1.0 display brighter-than-white instead of clamping. Needs an EDR display.
+    var edrEnabled: Bool = false
+    /// EDR white point: the tonemap maps the brightest highlights to this multiple of SDR white.
+    var edrPeak: Double = 2.0
 }
 
 /// Generates a simple procedural HDR-ish sky as an equirectangular texture (gradient + sun),
@@ -344,40 +448,95 @@ enum ProceduralSky {
 /// A compact control panel for the relightable rendering settings.
 struct RelightControlsView: View {
     @Bindable var controls: RelightControls
+    /// Collapsed by default so the panel doesn't cover the 3D view; tap the header to reveal controls.
+    @State private var isExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("Relight (split-sum IBL)", isOn: $controls.isEnabled)
-                .font(.subheadline.bold())
+            // Header: tap to expand/collapse. When collapsed only this bar shows.
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+            } label: {
+                HStack {
+                    Image(systemName: "slider.horizontal.3")
+                    Text("Render Controls").font(.subheadline.bold())
+                    Spacer()
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.up")
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
 
-            if controls.isEnabled {
-                Picker("Environment", selection: $controls.environmentChoice) {
-                    ForEach(RelightControls.EnvironmentChoice.allCases) { choice in
-                        Text(choice.label).tag(choice)
+            // Controls live in a height-capped scroll view so even when expanded the panel can't
+            // cover the whole screen.
+            if isExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("Relight (split-sum IBL)", isOn: $controls.isEnabled)
+                            .font(.subheadline.bold())
+
+                        if controls.isEnabled {
+                            Picker("Environment", selection: $controls.environmentChoice) {
+                                ForEach(RelightControls.EnvironmentChoice.allCases) { choice in
+                                    Text(choice.label).tag(choice)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            labeledSlider("Env rotation", value: $controls.rotationDegrees, range: 0...360)
+                            labeledSlider("Intensity", value: $controls.environmentIntensity, range: 0...3)
+
+                            Toggle("Use trained material", isOn: $controls.useTrainedMaterial)
+                                .font(.caption)
+                            if !controls.useTrainedMaterial {
+                                labeledSlider("Roughness", value: $controls.roughness, range: 0...1)
+                                labeledSlider("Reflection", value: $controls.reflectionStrength, range: 0...1)
+                            }
+
+                            Picker("Debug", selection: $controls.debugMode) {
+                                Text("Shaded").tag(0)
+                                Text("Normal").tag(1)
+                                Text("Rough").tag(2)
+                                Text("Refl").tag(3)
+                                Text("Env").tag(4)
+                                Text("Irr").tag(5)
+                                Text("Albedo").tag(6)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+
+                        Divider()
+
+                        // Presentation (display-only): the reference toggle keeps an exact, ground-
+                        // truth-comparable linear output; turning it off enables tonemap + exposure.
+                        Toggle("Reference (linear)", isOn: $controls.referenceMode)
+                            .font(.caption)
+                        if !controls.referenceMode {
+                            Picker("Tonemap", selection: $controls.tonemap) {
+                                ForEach(PostProcessor.Tonemap.allCases) { op in
+                                    Text(op.displayName).tag(op)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            labeledSlider("Exposure", value: $controls.exposureEV, range: -4...4)
+
+                            Toggle("Bloom", isOn: $controls.bloomEnabled)
+                                .font(.caption)
+                            if controls.bloomEnabled {
+                                labeledSlider("Threshold", value: $controls.bloomThreshold, range: 0...3)
+                                labeledSlider("Intensity", value: $controls.bloomIntensity, range: 0...1)
+                            }
+
+                            Toggle("EDR (extended range)", isOn: $controls.edrEnabled)
+                                .font(.caption)
+                            if controls.edrEnabled {
+                                labeledSlider("EDR peak", value: $controls.edrPeak, range: 1...4)
+                            }
+                        }
                     }
+                    .padding(.top, 2)
                 }
-                .pickerStyle(.segmented)
-
-                labeledSlider("Env rotation", value: $controls.rotationDegrees, range: 0...360)
-                labeledSlider("Intensity", value: $controls.environmentIntensity, range: 0...3)
-
-                Toggle("Use trained material", isOn: $controls.useTrainedMaterial)
-                    .font(.caption)
-                if !controls.useTrainedMaterial {
-                    labeledSlider("Roughness", value: $controls.roughness, range: 0...1)
-                    labeledSlider("Reflection", value: $controls.reflectionStrength, range: 0...1)
-                }
-
-                Picker("Debug", selection: $controls.debugMode) {
-                    Text("Shaded").tag(0)
-                    Text("Normal").tag(1)
-                    Text("Rough").tag(2)
-                    Text("Refl").tag(3)
-                    Text("Env").tag(4)
-                    Text("Irr").tag(5)
-                    Text("Albedo").tag(6)
-                }
-                .pickerStyle(.segmented)
+                .frame(maxHeight: 280)
             }
         }
         .padding(12)
