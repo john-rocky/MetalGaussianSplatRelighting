@@ -92,6 +92,26 @@ kernel void iblEquirectToCubemap(texture2d<float, access::sample> equirect [[tex
     cube.write(color, gid.xy, gid.z);
 }
 
+// Inverse of iblEquirectToCubemap: resample a cubemap into an equirectangular (lat/long) image.
+// Used to turn an externally-supplied environment cube (e.g. ARKit's room environment probe) into
+// the equirect that the IBL precompute and the skybox path both expect — so a runtime cubemap can
+// reuse the existing pipeline unchanged. The mapping is the exact inverse of dirToEquirectUV.
+kernel void iblCubemapToEquirect(texturecube<float, access::sample> cube [[texture(0)]],
+                                 texture2d<float, access::write> equirect [[texture(1)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    uint w = equirect.get_width();
+    uint h = equirect.get_height();
+    if (gid.x >= w || gid.y >= h) { return; }
+    float u = (float(gid.x) + 0.5f) / float(w);
+    float v = (float(gid.y) + 0.5f) / float(h);
+    float phi = (u - 0.5f) * 2.0f * ibl::PI;   // = atan2(z, x)
+    float theta = v * ibl::PI;                 // = acos(y)
+    float sinTheta = sin(theta);
+    float3 dir = normalize(float3(sinTheta * cos(phi), cos(theta), sinTheta * sin(phi)));
+    float4 color = cube.sample(ibl::cubeSampler, dir);
+    equirect.write(color, gid);
+}
+
 // Bind one mip slice of the output cube per dispatch (as its own texture view), and pass
 // that mip's roughness. envCube should have a full mip chain for variance reduction.
 kernel void iblPrefilterEnvmap(texturecube<float, access::sample> envCube [[texture(0)]],

@@ -6,7 +6,9 @@ import Foundation
 /// cubemap, and the environment BRDF (DFG) integration LUT.
 ///
 /// Construct from an equirectangular (lat/long) environment texture — e.g. an HDR panorama loaded
-/// via `MTKTextureLoader`. The maps are built once, on the GPU, at init.
+/// via `MTKTextureLoader` — or from a cubemap (e.g. ARKit's `AREnvironmentProbeAnchor`
+/// `environmentTexture`, which captures the surrounding room). The maps are built once, on the GPU,
+/// at init.
 public final class IBLEnvironment: @unchecked Sendable {
     public enum Constants {
         public static let baseCubeSize = 512
@@ -126,7 +128,47 @@ public final class IBLEnvironment: @unchecked Sendable {
         self.brdfLUT = lut
     }
 
+    /// Builds the IBL inputs from a cubemap environment (e.g. ARKit's room environment probe).
+    /// The cube is first resampled into an equirectangular panorama (so it also drives the skybox),
+    /// then the standard equirect path runs unchanged.
+    public convenience init(device: MTLDevice, cubemap: MTLTexture) throws {
+        let equirect = try Self.equirectangular(device: device, fromCubemap: cubemap)
+        try self.init(device: device, equirectangular: equirect)
+    }
+
     // MARK: - Helpers
+
+    /// Resamples a cubemap into a new equirectangular `.rgba16Float` texture via the
+    /// `iblCubemapToEquirect` kernel. Self-contained (own queue, commit + wait).
+    private static func equirectangular(device: MTLDevice,
+                                        fromCubemap cube: MTLTexture,
+                                        width: Int = 1024,
+                                        height: Int = 512) throws -> MTLTexture {
+        let library = try device.makeDefaultLibrary(bundle: Bundle.module)
+        guard let function = library.makeFunction(name: "iblCubemapToEquirect") else {
+            throw Error.functionNotFound("iblCubemapToEquirect")
+        }
+        let pipeline = try device.makeComputePipelineState(function: function)
+
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float,
+                                                                  width: width, height: height,
+                                                                  mipmapped: false)
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .private
+        guard let equirect = device.makeTexture(descriptor: descriptor) else { throw Error.textureCreationFailed }
+
+        guard let queue = device.makeCommandQueue(),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else { throw Error.commandCreationFailed }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(cube, index: 0)
+        encoder.setTexture(equirect, index: 1)
+        Self.dispatch2D(encoder, width: width, height: height)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return equirect
+    }
 
     private static func makeCubemap(device: MTLDevice,
                                     size: Int,

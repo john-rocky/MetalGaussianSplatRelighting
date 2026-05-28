@@ -133,6 +133,7 @@ fragment FragmentStore multiStageSplatFragmentShader(FragmentIn in [[stage_in]],
 }
 
 constexpr sampler skySampler(coord::normalized, s_address::repeat, t_address::clamp_to_edge, filter::linear);
+constexpr sampler arBgSampler(coord::normalized, address::clamp_to_edge, filter::linear);
 
 // Sample the full-resolution equirect environment as a skybox along this pixel's world-space view
 // ray (reconstructed by unprojecting near+far through the inverse view-projection). Uses the same
@@ -161,21 +162,32 @@ half4 resolveRelight(FragmentValues v,
                      texturecube<float> irradianceEnv,
                      texture2d<float> brdfLUT,
                      texture2d<float> environmentEquirect,
+                     texture2d<float> arCameraImage,
                      sampler iblSampler) {
     half coverage = v.color.a;
     half mw = v.materialWeight;
 
-    // Skybox background: only in shaded mode with relighting on; debug views keep a transparent bg.
-    bool showSky = (relight.enabled != 0 && relight.debugMode == 0);
-    half3 sky = showSky ? half3(skyboxColor(fragCoord, relight, environmentEquirect)) : half3(0.0h);
+    // Background: only in shaded mode with relighting on; debug views keep a transparent bg. In AR
+    // mode the live camera image (already display-transformed + linearized) replaces the skybox, so
+    // the splat composites over the real room; otherwise the equirect skybox is reconstructed by ray.
+    bool showBg = (relight.enabled != 0 && relight.debugMode == 0);
+    half3 bg = half3(0.0h);
+    if (showBg) {
+        if (relight.arBackground != 0) {
+            float2 uv = fragCoord.xy / max(relight.screenSize, float2(1.0f));
+            bg = half3(arCameraImage.sample(arBgSampler, uv).rgb);
+        } else {
+            bg = half3(skyboxColor(fragCoord, relight, environmentEquirect));
+        }
+    }
 
     if (relight.enabled == 0 || coverage <= 0.0001h) {
-        return showSky ? half4(sky, 1.0h) : v.color;
+        return showBg ? half4(bg, 1.0h) : v.color;
     }
     // Pixels with no camera-facing material (mw ~ 0) have no usable surface normal -> show the
     // blended SH color (premultiplied) instead of normalizing a near-zero vector into noise.
     if (mw <= 0.0001h) {
-        return showSky ? half4(v.color.rgb + sky * (1.0h - coverage), 1.0h) : v.color;
+        return showBg ? half4(v.color.rgb + bg * (1.0h - coverage), 1.0h) : v.color;
     }
     float invCov = 1.0f / float(coverage);
     float invMW = 1.0f / float(mw);
@@ -190,8 +202,8 @@ half4 resolveRelight(FragmentValues v,
     if (relight.debugMode != 0) {
         return half4(shaded * coverage, coverage);   // debug channels: premultiplied, transparent bg
     }
-    // Shaded splats composited over the environment skybox (opaque result).
-    return half4(shaded * coverage + sky * (1.0h - coverage), 1.0h);
+    // Shaded splats composited over the background (skybox or AR camera; opaque result).
+    return half4(shaded * coverage + bg * (1.0h - coverage), 1.0h);
 }
 
 /// Generate a single triangle covering the entire screen
@@ -214,10 +226,11 @@ fragment FragmentOut postprocessFragmentShader(FragmentValues fragmentValues [[i
                                                texture2d<float> brdfLUT [[ texture(1) ]],
                                                texturecube<float> irradianceEnv [[ texture(2) ]],
                                                texture2d<float> environmentEquirect [[ texture(3) ]],
+                                               texture2d<float> arCameraImage [[ texture(4) ]],
                                                sampler iblSampler [[ sampler(0) ]]) {
     FragmentOut out;
     out.depth = (fragmentValues.color.a == 0) ? 0 : fragmentValues.depth / fragmentValues.color.a;
-    out.color = resolveRelight(fragmentValues, fragCoord, relight, prefilteredEnv, irradianceEnv, brdfLUT, environmentEquirect, iblSampler);
+    out.color = resolveRelight(fragmentValues, fragCoord, relight, prefilteredEnv, irradianceEnv, brdfLUT, environmentEquirect, arCameraImage, iblSampler);
     return out;
 }
 
@@ -228,6 +241,7 @@ fragment half4 postprocessFragmentShaderNoDepth(FragmentValues fragmentValues [[
                                                 texture2d<float> brdfLUT [[ texture(1) ]],
                                                 texturecube<float> irradianceEnv [[ texture(2) ]],
                                                 texture2d<float> environmentEquirect [[ texture(3) ]],
+                                                texture2d<float> arCameraImage [[ texture(4) ]],
                                                 sampler iblSampler [[ sampler(0) ]]) {
-    return resolveRelight(fragmentValues, fragCoord, relight, prefilteredEnv, irradianceEnv, brdfLUT, environmentEquirect, iblSampler);
+    return resolveRelight(fragmentValues, fragCoord, relight, prefilteredEnv, irradianceEnv, brdfLUT, environmentEquirect, arCameraImage, iblSampler);
 }

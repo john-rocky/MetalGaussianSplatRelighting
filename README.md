@@ -8,7 +8,8 @@
 
 Load a [Ref-Gaussian](https://github.com/fudan-zvg/ref-gaussian)–trained scene and relight it live on an
 iPhone: swap and rotate the HDR environment and watch the reflections and shading respond, with the
-environment drawn behind the object as a skybox. Built on top of
+environment drawn behind the object as a skybox. Or drop the object into your real room in **AR**, lit by
+the room's actual lighting and composited over the live camera. Built on top of
 [scier/MetalSplatter](https://github.com/scier/MetalSplatter) (which renders splats but does not relight),
 this fork adds a full **split-sum image-based-lighting (IBL)** pipeline and **deferred physically-based
 shading** for relightable assets.
@@ -28,6 +29,9 @@ shading** for relightable assets.
 - **HDR environment + skybox** — load an equirectangular HDR; it lights the object *and* is drawn as the
   background (reconstructed per pixel from the inverse view-projection), so reflections match the scene
   behind the object. Switch between bundled environments and rotate them live.
+- **AR mode** — place the relit splat in your real room with ARKit: the live camera feed is the
+  background, the object is lit by (and reflects) the room via ARKit environment probes, and it stays
+  world-anchored as you move the device around it. Pinch to scale and drag to rotate it in place.
 - **Ref-Gaussian 2D-surfel assets** — SplatIO reads the non-standard 281-float `.ply` (per-splat PBR
   material, surfel normal reconstructed from the rotation quaternion).
 - **Interactive orbit camera** — drag to rotate, pinch to zoom, with a Z-up→Y-up calibration for
@@ -50,6 +54,22 @@ HDR equirect ──▶ IBL precompute ──▶ prefiltered cube + irradiance cu
 Reflections and the skybox sample the same environment in a single consistent frame, so they always
 agree. Normals are oriented per-pixel toward the camera (matching Ref-Gaussian's `flip_align_view`).
 
+## AR mode
+
+Selecting **AR / Room** runs an `ARWorldTrackingConfiguration` with automatic environment texturing and
+reuses the same deferred-relighting pipeline:
+
+- ARKit's `AREnvironmentProbeAnchor` provides a full surround **cubemap** of the room, which is fed
+  straight into the IBL precompute — so the object is lit by, and reflects, your actual room.
+- The captured camera frame (YCbCr) is converted to a linear-RGB background and composited *in the same
+  resolve pass* that normally draws the skybox — splats sit over the live camera with no extra blend.
+- The model is world-anchored a fixed distance ahead at placement and viewed through the `ARCamera`
+  view/projection, so it holds its place as you walk around it; pinch scales and drag rotates it.
+
+A note on correctness: a single rear camera only sees its frustum, so reflections of directions behind
+the camera can't be measured — ARKit fills those in with machine-learning estimation. This reads well on
+glossy/rough materials (the reflection is blurred anyway) and improves as you look around the room.
+
 ## Build & run
 
 1. Open `SampleApp/MetalSplatter_SampleApp.xcodeproj`.
@@ -58,6 +78,8 @@ agree. Normals are oriented per-pixel toward the camera (matching Ref-Gaussian's
 4. Open a Ref-Gaussian `.ply`. Use the on-screen panel to toggle relighting, swap/rotate the
    environment, adjust intensity, and inspect debug channels (normal / roughness / reflectance /
    albedo / prefiltered env / irradiance).
+5. Pick the **AR / Room** environment to place the object in your real room (the app requests camera
+   access). Move the device to look around it; pinch to scale and drag to rotate. Keep relighting on.
 
 A reflective object (e.g. the Shiny-Blender `car` or a chrome sphere) shows the relighting best; a matte
 object intentionally reflects very little.

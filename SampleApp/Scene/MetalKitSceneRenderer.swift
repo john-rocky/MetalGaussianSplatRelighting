@@ -11,6 +11,12 @@ import simd
 import SplatIO
 import SwiftUI
 
+#if os(iOS)
+import ARKit
+import CoreVideo
+import UIKit
+#endif
+
 @MainActor
 class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private static let log =
@@ -42,6 +48,37 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var appliedEnvironmentChoice: RelightControls.EnvironmentChoice?
     private var environmentCache: [RelightControls.EnvironmentChoice: IBLEnvironment] = [:]
 
+#if os(iOS)
+    /// Drives the "AR / Room" environment: an ARKit session that surfaces the room's environment
+    /// probe cubemap (for relighting) and per-frame camera image + pose (for full AR). Created lazily
+    /// when AR/Room is first selected; paused when leaving it.
+    private var arProbeProvider: ARRoomProbeProvider?
+    /// Last time the AR-room IBL was rebuilt, used to throttle the GPU-heavy precompute.
+    private var lastARProbeBuild: Date?
+    private static let arProbeRebuildInterval: TimeInterval = 1.0
+
+    /// Converts the ARKit captured frame (YCbCr) into the linear-RGB background the splat composites
+    /// over; the converted image, a cache for wrapping the camera planes, and the world placement.
+    private lazy var cameraBackgroundConverter: CameraBackgroundConverter? =
+        try? CameraBackgroundConverter(device: device, colorFormat: sceneColorFormat)
+    private var cameraTextureCache: CVMetalTextureCache?
+    private var arBackgroundTexture: MTLTexture?
+    /// World transform where the model is anchored in AR, set once when tracking is first available.
+    private var arModelAnchor: matrix_float4x4?
+    /// Placement distance (meters) ahead of the camera when the model is first anchored in AR.
+    private static let arModelDistance: Float = 1.2
+
+    /// User manipulation of the AR-anchored model, analogous to the orbit camera: pinch scales it,
+    /// drag yaws/pitches it. `arActive` mirrors draw()'s AR state so the gesture handlers target the
+    /// model instead of the orbit camera. Reset when AR is left (the model is re-placed on re-entry).
+    private var arActive = false
+    private var arModelYaw: Angle = .zero
+    private var arModelPitch: Angle = .zero
+    private var arModelScale: Float = 0.4
+    private var pinchReferenceScale: Float = 0.4
+    private static let arModelScaleRange: ClosedRange<Float> = 0.05...3.0
+#endif
+
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
 
     var lastRotationUpdateTimestamp: Date? = nil
@@ -55,20 +92,50 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var cameraDistance: Float = Constants.cameraInitialDistance
     var userHasInteracted = false
 
+    /// Zoom target snapshotted at pinch start (orbit distance), so the cumulative gesture scale maps
+    /// relative to it. The AR model-scale reference is `pinchReferenceScale`.
+    private var pinchReferenceDistance: Float = Constants.cameraInitialDistance
+
     var drawableSize: CGSize = .zero
 
-    /// Apply an orbit drag (screen-point deltas). Disables auto-rotation on first use.
+    /// Apply a drag (screen-point deltas): in AR it yaws/pitches the anchored model, otherwise it
+    /// orbits the camera (and disables auto-rotation on first use).
     func orbitBy(dx: Float, dy: Float) {
+#if os(iOS)
+        if arActive {
+            arModelYaw += Angle(radians: Double(dx * Constants.cameraOrbitRadiansPerPoint))
+            let pitch = arModelPitch.radians + Double(dy * Constants.cameraOrbitRadiansPerPoint)
+            arModelPitch = Angle(radians: min(max(pitch, -Constants.cameraPitchLimit.radians), Constants.cameraPitchLimit.radians))
+            return
+        }
+#endif
         userHasInteracted = true
         cameraYaw += Angle(radians: Double(dx * Constants.cameraOrbitRadiansPerPoint))
         let newPitch = cameraPitch.radians + Double(dy * Constants.cameraOrbitRadiansPerPoint)
         cameraPitch = Angle(radians: min(max(newPitch, -Constants.cameraPitchLimit.radians), Constants.cameraPitchLimit.radians))
     }
 
-    /// Apply a pinch-zoom. `scale` is the gesture's cumulative scale relative to `referenceDistance`.
-    func zoomBy(scale: Float, referenceDistance: Float) {
+    /// Snapshots the pinch target (orbit distance + AR model scale) at gesture start, so the
+    /// cumulative gesture scale in `zoomBy` maps relative to it.
+    func pinchBegan() {
+        pinchReferenceDistance = cameraDistance
+#if os(iOS)
+        pinchReferenceScale = arModelScale
+#endif
+    }
+
+    /// Apply a pinch: in AR it scales the anchored model, otherwise it dollies the orbit camera.
+    /// `scale` is the gesture's cumulative scale relative to the `pinchBegan` snapshot.
+    func zoomBy(scale: Float) {
+#if os(iOS)
+        if arActive {
+            arModelScale = min(max(pinchReferenceScale * scale, Self.arModelScaleRange.lowerBound),
+                               Self.arModelScaleRange.upperBound)
+            return
+        }
+#endif
         userHasInteracted = true
-        cameraDistance = min(max(referenceDistance / max(scale, 0.0001), Constants.cameraMinDistance), Constants.cameraMaxDistance)
+        cameraDistance = min(max(pinchReferenceDistance / max(scale, 0.0001), Constants.cameraMinDistance), Constants.cameraMaxDistance)
     }
 
     init?(_ metalKitView: MTKView) {
@@ -235,8 +302,39 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         updateRotation()
         proceduralSplatController?.update()
 
+        let drawableTexture = drawable.texture
+        ensureHDRTexture(width: drawableTexture.width, height: drawableTexture.height)
+
+        let splat = modelRenderer as? SplatRenderer
+
+        // Full AR: when "AR / Room" is selected and a tracked camera frame is available, drive the
+        // camera from ARKit (view/projection from ARCamera, model anchored in the world) and convert
+        // the captured frame into the background the splat composites over. Otherwise the orbit camera
+        // + skybox path is used (including while the AR session is still warming up).
+        var activeViewport = viewport
+        var arActive = false
+#if os(iOS)
+        var arFrame: ARFrame?
+        if relightControls?.environmentChoice == .arRoom {
+            arFrame = arProbeProvider?.currentFrame
+        }
+        if let arFrame,
+           let arVP = arViewport(for: arFrame, drawableSize: CGSize(width: drawableTexture.width,
+                                                                    height: drawableTexture.height)),
+           let splat,
+           let background = prepareARBackground(frame: arFrame, drawableTexture: drawableTexture,
+                                                commandBuffer: commandBuffer) {
+            activeViewport = arVP
+            splat.arBackgroundTexture = background
+            arActive = true
+        } else {
+            splat?.arBackgroundTexture = nil
+        }
+        self.arActive = arActive   // let the gesture handlers target the model while AR is rendering
+#endif
+
         // Apply relighting controls to the splat renderer (if any).
-        if let splat = modelRenderer as? SplatRenderer, let controls = relightControls {
+        if let splat, let controls = relightControls {
             // Build / swap the IBL environment when the selected choice changes (cached after first use).
             if appliedEnvironmentChoice != controls.environmentChoice {
                 applyEnvironment(controls.environmentChoice, to: splat)
@@ -256,18 +354,16 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             settings.debugMode = UInt32(controls.debugMode)
             settings.roughnessOverride = controls.useTrainedMaterial ? -1 : Float(controls.roughness)
             settings.reflectionStrengthOverride = controls.useTrainedMaterial ? -1 : Float(controls.reflectionStrength)
+            settings.arBackground = arActive   // composite over the live camera instead of the skybox
             splat.relightSettings = settings
         }
 
         // Pass 1: render the scene into the offscreen linear-HDR target. Relighting completes here in
         // linear HDR, untouched by any presentation.
-        let drawableTexture = drawable.texture
-        ensureHDRTexture(width: drawableTexture.width, height: drawableTexture.height)
-
         let didRender: Bool
         if let hdr = hdrTexture {
             do {
-                didRender = try modelRenderer.render(viewports: [viewport],
+                didRender = try modelRenderer.render(viewports: [activeViewport],
                                                      colorTexture: hdr,
                                                      colorStoreAction: .store,
                                                      depthTexture: view.depthStencilTexture,
@@ -303,6 +399,20 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     /// Builds (or reuses) the IBL environment for `choice` and assigns it to the splat renderer.
     /// Falls back to the procedural sky if the bundled HDR can't be loaded or precomputed.
     private func applyEnvironment(_ choice: RelightControls.EnvironmentChoice, to splat: SplatRenderer) {
+#if os(iOS)
+        if choice == .arRoom {
+            startARRoom(for: splat)
+            return
+        }
+        // Switching away from AR/Room: pause the session so the camera isn't left running, and drop
+        // the world anchor + user manipulation so the model is re-placed fresh if AR is re-entered.
+        arProbeProvider?.stop()
+        arModelAnchor = nil
+        arModelYaw = .zero
+        arModelPitch = .zero
+        arModelScale = 0.4
+        arActive = false
+#endif
         if let cached = environmentCache[choice] {
             splat.environment = cached
             return
@@ -320,6 +430,135 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             applyEnvironment(.procedural, to: splat)   // studio asset unavailable -> graceful fallback
         }
     }
+
+#if os(iOS)
+    /// Starts (or resumes) the ARKit room-probe session and rebuilds the IBL environment from the
+    /// room's environment cubemap whenever ARKit updates it. Until the first probe resolves the
+    /// previously-applied environment stays in place; on devices without world tracking (e.g. the
+    /// Simulator) it falls back to the procedural sky.
+    private func startARRoom(for splat: SplatRenderer) {
+        guard ARRoomProbeProvider.isSupported else {
+            applyEnvironment(.procedural, to: splat)
+            return
+        }
+        let provider = arProbeProvider ?? ARRoomProbeProvider()
+        arProbeProvider = provider
+        provider.onUpdate = { [weak self, weak splat] cubemap in
+            guard let self, let splat else { return }
+            // Throttle: the IBL precompute is GPU-heavy and ARKit can update the probe frequently.
+            let now = Date()
+            if let last = self.lastARProbeBuild,
+               now.timeIntervalSince(last) < Self.arProbeRebuildInterval { return }
+            self.lastARProbeBuild = now
+            if let environment = try? IBLEnvironment(device: self.device, cubemap: cubemap) {
+                splat.environment = environment
+            }
+        }
+        provider.start()
+    }
+
+    /// Builds the AR viewport from the current ARCamera: world->camera view + ARKit projection (both
+    /// oriented for the interface), with the model placed at a fixed world anchor (scaled, Z-up->Y-up).
+    /// Returns nil until tracking is usable, so the model isn't anchored from a bad pose.
+    private func arViewport(for frame: ARFrame, drawableSize: CGSize) -> ModelRendererViewportDescriptor? {
+        guard drawableSize.width > 0, drawableSize.height > 0 else { return nil }
+        if case .notAvailable = frame.camera.trackingState { return nil }
+        let camera = frame.camera
+        let orientation = currentInterfaceOrientation()
+
+        // Place the model once: a fixed distance ahead of the initial camera, at eye height and
+        // world-axis-aligned (upright regardless of how the device was tilted when AR started).
+        if arModelAnchor == nil {
+            let transform = camera.transform
+            var forward = -SIMD3<Float>(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
+            forward.y = 0
+            let length = simd_length(forward)
+            forward = length > 1e-4 ? forward / length : SIMD3<Float>(0, 0, -1)
+            let origin = SIMD3<Float>(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
+            let position = origin + forward * Self.arModelDistance
+            var anchor = matrix_identity_float4x4
+            anchor.columns.3 = SIMD4<Float>(position, 1)
+            arModelAnchor = anchor
+        }
+        guard let anchor = arModelAnchor else { return nil }
+
+        let viewWorld = camera.viewMatrix(for: orientation)   // world -> camera
+        let projection = camera.projectionMatrix(for: orientation, viewportSize: drawableSize,
+                                                  zNear: 0.01, zFar: 100)
+        let upCalibration = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+        // User manipulation at the anchor: drag = yaw (about world up) + pitch, pinch = scale.
+        let yaw = matrix4x4_rotation(radians: Float(arModelYaw.radians), axis: SIMD3<Float>(0, 1, 0))
+        let pitch = matrix4x4_rotation(radians: Float(arModelPitch.radians), axis: SIMD3<Float>(1, 0, 0))
+        let modelWorld = anchor * yaw * pitch * matrix4x4_scale(arModelScale) * upCalibration
+        let viewMatrix = viewWorld * modelWorld
+
+        let mtlViewport = MTLViewport(originX: 0, originY: 0,
+                                      width: drawableSize.width, height: drawableSize.height,
+                                      znear: 0, zfar: 1)
+        return ModelRendererViewportDescriptor(viewport: mtlViewport,
+                                               projectionMatrix: projection,
+                                               viewMatrix: viewMatrix,
+                                               screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
+    }
+
+    private func currentInterfaceOrientation() -> UIInterfaceOrientation {
+        metalKitView.window?.windowScene?.interfaceOrientation ?? .portrait
+    }
+
+    /// Converts the captured frame's YCbCr planes into the linear-RGB background texture (sized to the
+    /// drawable) and encodes that pass into `commandBuffer`, returning the texture (nil on failure).
+    private func prepareARBackground(frame: ARFrame, drawableTexture: MTLTexture,
+                                     commandBuffer: MTLCommandBuffer) -> MTLTexture? {
+        guard let converter = cameraBackgroundConverter else { return nil }
+        let pixelBuffer = frame.capturedImage
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
+              let luma = cameraPlaneTexture(pixelBuffer, plane: 0, format: .r8Unorm),
+              let chroma = cameraPlaneTexture(pixelBuffer, plane: 1, format: .rg8Unorm) else { return nil }
+        ensureARBackgroundTexture(width: drawableTexture.width, height: drawableTexture.height)
+        guard let destination = arBackgroundTexture else { return nil }
+
+        // displayTransform maps image uv -> viewport uv; invert it for the shader (viewport -> image).
+        let viewportSize = CGSize(width: drawableTexture.width, height: drawableTexture.height)
+        let inverse = frame.displayTransform(for: currentInterfaceOrientation(),
+                                             viewportSize: viewportSize).inverted()
+        let displayToCamera = simd_float3x3(SIMD3<Float>(Float(inverse.a), Float(inverse.b), 0),
+                                            SIMD3<Float>(Float(inverse.c), Float(inverse.d), 0),
+                                            SIMD3<Float>(Float(inverse.tx), Float(inverse.ty), 1))
+        converter.encode(into: commandBuffer, luma: luma, chroma: chroma,
+                         displayToCamera: displayToCamera, destination: destination)
+        return destination
+    }
+
+    private func ensureARBackgroundTexture(width: Int, height: Int) {
+        if let texture = arBackgroundTexture, texture.width == width, texture.height == height { return }
+        guard width > 0, height > 0 else { return }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: sceneColorFormat,
+                                                                  width: width, height: height,
+                                                                  mipmapped: false)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        let texture = device.makeTexture(descriptor: descriptor)
+        texture?.label = "AR Camera Background"
+        arBackgroundTexture = texture
+    }
+
+    /// Wraps one plane of an ARKit captured-image pixel buffer as an MTLTexture (no copy).
+    private func cameraPlaneTexture(_ pixelBuffer: CVPixelBuffer, plane: Int,
+                                    format: MTLPixelFormat) -> MTLTexture? {
+        if cameraTextureCache == nil {
+            CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cameraTextureCache)
+        }
+        guard let cache = cameraTextureCache else { return nil }
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+        var cvTexture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer,
+                                                               nil, format, width, height, plane, &cvTexture)
+        guard status == kCVReturnSuccess, let cvTexture,
+              let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
+        return texture
+    }
+#endif
 }
 
 // MARK: - Relighting controls, environment, and UI
@@ -331,21 +570,22 @@ final class RelightControls {
     /// Selectable image-based-lighting environment. `studio` loads a bundled HDR panorama; reflections
     /// (and the Env-rotation slider) respond to whichever is chosen.
     enum EnvironmentChoice: Int, CaseIterable, Identifiable {
-        case autoshop, studio, procedural
+        case autoshop, studio, procedural, arRoom
         var id: Int { rawValue }
         var label: String {
             switch self {
             case .autoshop: return "Auto Shop"
             case .studio: return "Studio"
             case .procedural: return "Procedural"
+            case .arRoom: return "AR / Room"
             }
         }
-        /// Bundled equirect resource name, or nil for the procedural sky.
+        /// Bundled equirect resource name, or nil for the procedural sky / runtime AR room probe.
         var resourceName: String? {
             switch self {
             case .autoshop: return "autoshop_env"
             case .studio: return "studio_env"
-            case .procedural: return nil
+            case .procedural, .arRoom: return nil
             }
         }
     }
@@ -554,5 +794,69 @@ struct RelightControlsView: View {
         }
     }
 }
+
+#if os(iOS)
+
+// MARK: - AR room environment probe
+
+/// Runs a minimal ARKit world-tracking session purely to obtain the room's lighting. With
+/// `environmentTexturing = .automatic`, ARKit produces `AREnvironmentProbeAnchor`s whose
+/// `environmentTexture` is an MTLTexture **cubemap** of the surrounding room; that cube is handed to
+/// `IBLEnvironment` so the splat is lit by — and reflects — the real room. (Camera passthrough and
+/// world anchoring are the next AR stage; this stage only borrows the room's light.)
+@MainActor
+final class ARRoomProbeProvider: NSObject, ARSessionDelegate {
+    /// Whether this device supports the world tracking required for environment probes.
+    static var isSupported: Bool { ARWorldTrackingConfiguration.isSupported }
+
+    private let session = ARSession()
+    private var isRunning = false
+
+    /// Invoked on the main actor with the latest room environment cubemap each time ARKit updates it.
+    var onUpdate: (@MainActor (MTLTexture) -> Void)?
+
+    /// The latest ARKit frame (camera pose + captured image), read by the renderer each draw for full AR.
+    var currentFrame: ARFrame? { session.currentFrame }
+
+    func start() {
+        guard Self.isSupported, !isRunning else { return }
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.environmentTexturing = .automatic
+        session.delegate = self
+        session.run(configuration)
+        isRunning = true
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        session.pause()
+        isRunning = false
+    }
+
+    // ARKit may call these off the main thread; hop to the main actor before delivering the texture.
+    nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        deliverLatestProbe(from: anchors)
+    }
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        deliverLatestProbe(from: anchors)
+    }
+
+    nonisolated private func deliverLatestProbe(from anchors: [ARAnchor]) {
+        guard let texture = anchors
+            .compactMap({ ($0 as? AREnvironmentProbeAnchor)?.environmentTexture })
+            .last else { return }
+        let boxed = SendableTexture(texture)
+        Task { @MainActor in self.onUpdate?(boxed.texture) }
+    }
+}
+
+/// Carries a non-Sendable Metal texture across the ARKit-callback → main-actor hop. Safe because the
+/// texture is only ever read on the main actor and ARKit hands us a fresh, immutable cube each time.
+private struct SendableTexture: @unchecked Sendable {
+    let texture: MTLTexture
+    init(_ texture: MTLTexture) { self.texture = texture }
+}
+
+#endif // os(iOS)
 
 #endif // os(iOS) || os(macOS)

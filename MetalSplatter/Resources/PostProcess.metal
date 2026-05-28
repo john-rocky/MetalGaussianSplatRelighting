@@ -149,3 +149,40 @@ fragment half4 ppComposite(PPVertexOut in [[stage_in]],
     }
     return half4(half3(mapped), half(src.a));
 }
+
+// MARK: - AR camera background (YCbCr -> linear RGB)
+//
+// Converts an ARKit captured frame (biplanar YCbCr: luma R8 + chroma RG8) into the linear-HDR
+// background image that the splat resolve composites over (MultiStageRenderPath `resolveRelight`,
+// arBackground path). `displayToCamera` maps top-left-origin viewport uv -> captured-image uv
+// (ARFrame.displayTransform inverted), so the camera fills the screen at the right orientation/crop.
+
+typedef struct {
+    float3x3 displayToCamera;   // top-left-origin viewport uv (homogeneous) -> camera image uv
+} ARCameraUniforms;
+
+vertex PPVertexOut arCameraVertexShader(uint vertexID [[vertex_id]]) {
+    float2 p = float2((vertexID == 1) ? 3.0 : -1.0, (vertexID == 2) ? 3.0 : -1.0);
+    PPVertexOut out;
+    out.position = float4(p, 0.0, 1.0);
+    out.uv = float2((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);   // top-left origin (matches displayTransform)
+    return out;
+}
+
+fragment float4 arCameraBackground(PPVertexOut in [[stage_in]],
+                                   texture2d<float> lumaTex [[texture(0)]],
+                                   texture2d<float> chromaTex [[texture(1)]],
+                                   constant ARCameraUniforms &u [[buffer(0)]]) {
+    float2 imageUV = (u.displayToCamera * float3(in.uv, 1.0)).xy;
+    float y = lumaTex.sample(ppLinearSampler, imageUV).r;
+    float2 cbcr = chromaTex.sample(ppLinearSampler, imageUV).rg;
+    // Video-range YCbCr -> full-range sRGB RGB (Apple's ARKit Metal sample matrix).
+    const float4x4 ycbcrToRGB = float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
+                                         float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
+                                         float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
+                                         float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
+    float3 rgb = saturate((ycbcrToRGB * float4(y, cbcr, 1.0f)).rgb);
+    // sRGB (display) -> linear, so the camera composites correctly in the linear-HDR pipeline.
+    float3 lin = select(rgb / 12.92f, pow((rgb + 0.055f) / 1.055f, float3(2.4f)), rgb > 0.04045f);
+    return float4(lin, 1.0f);
+}

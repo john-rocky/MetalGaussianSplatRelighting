@@ -19,7 +19,6 @@ struct MetalKitSceneView: ViewRepresentable {
     class Coordinator: NSObject {
         var renderer: MetalKitSceneRenderer?
         private var panLastTranslation: CGPoint = .zero
-        private var pinchReferenceDistance: Float = Constants.cameraInitialDistance
 
 #if os(iOS)
         @objc func handlePan(_ g: UIPanGestureRecognizer) {
@@ -30,8 +29,8 @@ struct MetalKitSceneView: ViewRepresentable {
             panLastTranslation = t
         }
         @objc func handlePinch(_ g: UIPinchGestureRecognizer) {
-            if g.state == .began { pinchReferenceDistance = renderer?.cameraDistance ?? Constants.cameraInitialDistance }
-            renderer?.zoomBy(scale: Float(g.scale), referenceDistance: pinchReferenceDistance)
+            if g.state == .began { renderer?.pinchBegan() }
+            renderer?.zoomBy(scale: Float(g.scale))
         }
 #elseif os(macOS)
         @objc func handlePan(_ g: NSPanGestureRecognizer) {
@@ -43,8 +42,8 @@ struct MetalKitSceneView: ViewRepresentable {
             panLastTranslation = t
         }
         @objc func handleMagnify(_ g: NSMagnificationGestureRecognizer) {
-            if g.state == .began { pinchReferenceDistance = renderer?.cameraDistance ?? Constants.cameraInitialDistance }
-            renderer?.zoomBy(scale: Float(1 + g.magnification), referenceDistance: pinchReferenceDistance)
+            if g.state == .began { renderer?.pinchBegan() }
+            renderer?.zoomBy(scale: Float(1 + g.magnification))
         }
 #endif
     }

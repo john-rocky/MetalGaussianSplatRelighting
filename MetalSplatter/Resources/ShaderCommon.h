@@ -74,7 +74,7 @@ typedef struct
 } UniformsArray;
 
 // Relightable rendering parameters. Bound at BufferIndexRelight to the splat vertex shaders.
-// Keep in sync with Swift: SplatRenderer.RelightUniforms (160 bytes)
+// Keep in sync with Swift: SplatRenderer.RelightUniforms
 typedef struct
 {
     matrix_float4x4 envRotation;          // rotates the world-space sample direction (environment orientation)
@@ -86,6 +86,8 @@ typedef struct
     float roughnessOverride;              // >= 0 overrides per-splat roughness (useful for synthetic materials)
     float reflectionStrengthOverride;     // >= 0 overrides per-splat reflection strength
     vector_float2 screenSize;             // render-target size in pixels (skybox ray reconstruction)
+    uint arBackground;                    // 1 = composite over the AR camera image (texture 4) instead of the skybox
+    uint _arPadding;                      // keep 16-byte struct tail explicit
 } RelightUniforms;
 
 // Keep in sync with EncodedSplatPoint

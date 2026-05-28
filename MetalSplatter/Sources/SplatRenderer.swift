@@ -106,7 +106,7 @@ public final class SplatRenderer: @unchecked Sendable {
         var _shPadding: (UInt8, UInt8) = (0, 0)
     }
 
-    // Keep in sync with ShaderCommon.h : RelightUniforms (160 bytes)
+    // Keep in sync with ShaderCommon.h : RelightUniforms
     struct RelightUniforms {
         var envRotation: matrix_float4x4
         var inverseViewProjection: matrix_float4x4
@@ -117,6 +117,8 @@ public final class SplatRenderer: @unchecked Sendable {
         var roughnessOverride: Float
         var reflectionStrengthOverride: Float
         var screenSize: SIMD2<Float> = .zero
+        var arBackground: UInt32 = 0
+        var _arPadding: UInt32 = 0
     }
 
     /// User-facing relightable-rendering settings. Mutate between frames to control IBL.
@@ -130,6 +132,9 @@ public final class SplatRenderer: @unchecked Sendable {
         public var roughnessOverride: Float = -1
         /// < 0 uses per-splat reflection strength; >= 0 overrides it.
         public var reflectionStrengthOverride: Float = -1
+        /// When true, splats composite over `arBackgroundTexture` (the live AR camera image) instead
+        /// of the equirect skybox. Requires `arBackgroundTexture` to be set.
+        public var arBackground: Bool = false
         public init() {}
     }
 
@@ -152,6 +157,10 @@ public final class SplatRenderer: @unchecked Sendable {
 
     /// The image-based-lighting environment used when relighting is enabled. `nil` disables relighting.
     public var environment: IBLEnvironment?
+
+    /// Optional background image the splats composite over when `RelightSettings.arBackground` is set
+    /// (the live AR camera frame, converted to linear RGB). When nil the equirect skybox is used.
+    public var arBackgroundTexture: MTLTexture?
 
     /// Relightable rendering settings (enable flag, environment rotation, debug mode, overrides).
     public var relightSettings = RelightSettings()
@@ -371,6 +380,7 @@ public final class SplatRenderer: @unchecked Sendable {
     private func makeRelightUniforms(inverseViewProjection: matrix_float4x4 = matrix_identity_float4x4,
                                      screenSize: SIMD2<Float> = .zero) -> RelightUniforms {
         let active = relightSettings.isEnabled && environment != nil
+        let useARBackground = active && relightSettings.arBackground && arBackgroundTexture != nil
         return RelightUniforms(envRotation: relightSettings.environmentRotation,
                                inverseViewProjection: inverseViewProjection,
                                enabled: active ? 1 : 0,
@@ -379,7 +389,8 @@ public final class SplatRenderer: @unchecked Sendable {
                                envIntensity: relightSettings.environmentIntensity,
                                roughnessOverride: relightSettings.roughnessOverride,
                                reflectionStrengthOverride: relightSettings.reflectionStrengthOverride,
-                               screenSize: screenSize)
+                               screenSize: screenSize,
+                               arBackground: useARBackground ? 1 : 0)
     }
 
     // MARK: - Chunk Management
@@ -1061,6 +1072,7 @@ public final class SplatRenderer: @unchecked Sendable {
             renderEncoder.setFragmentTexture(environment?.brdfLUT ?? dummyLUT, index: 1)
             renderEncoder.setFragmentTexture(environment?.irradianceCubemap ?? dummyCube, index: 2)
             renderEncoder.setFragmentTexture(environment?.equirectangular ?? dummyLUT, index: 3)  // full-res skybox
+            renderEncoder.setFragmentTexture(arBackgroundTexture ?? dummyLUT, index: 4)  // AR camera background
             renderEncoder.setFragmentSamplerState(iblSampler, index: 0)
             renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             renderEncoder.popDebugGroup()
