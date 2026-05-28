@@ -80,6 +80,14 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var arModelLengthMeters: Float = 4.5
     private var pinchReferenceLength: Float = 4.5
     private static let arModelLengthRange: ClosedRange<Float> = 0.3...15.0
+    /// Turntable showcase: timestamp for the time-based auto-rotation, and its speed (rad/s).
+    private var lastTurntableTimestamp: Date?
+    private static let turntableSpeed: Float = 0.35
+
+    /// Depth occlusion (LiDAR): whether scene depth was available this frame, and the (A, B) that map
+    /// a splat's NDC depth to meters for comparison against the scene depth. Set in prepareARBackground.
+    private var arOcclusionEnabled = false
+    private var arDepthLinearize: SIMD2<Float> = .zero
 
     /// Soft elliptical contact shadow on the floor under the model, so it reads as grounded.
     private lazy var groundShadowRenderer: GroundShadowRenderer? =
@@ -351,6 +359,17 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             if arFloorPosition == nil {
                 _ = tryPlaceOnFloor(normalizedPoint: CGPoint(x: 0.5, y: 0.5), frame: arFrame)
             }
+            // Turntable showcase: advance the model's yaw over time (frame-rate independent) so it
+            // rotates hands-free; the contact shadow and reflections follow because yaw is applied first.
+            if relightControls?.turntable == true {
+                let now = Date()
+                if let last = lastTurntableTimestamp {
+                    arModelYaw += Angle(radians: Double(Self.turntableSpeed) * now.timeIntervalSince(last))
+                }
+                lastTurntableTimestamp = now
+            } else {
+                lastTurntableTimestamp = nil
+            }
             if let arVP = arViewport(for: arFrame, drawableSize: CGSize(width: drawableTexture.width,
                                                                         height: drawableTexture.height)),
                let splat,
@@ -392,6 +411,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             settings.roughnessOverride = controls.useTrainedMaterial ? -1 : Float(controls.roughness)
             settings.reflectionStrengthOverride = controls.useTrainedMaterial ? -1 : Float(controls.reflectionStrength)
             settings.arBackground = arActive   // composite over the live camera instead of the skybox
+#if os(iOS)
+            settings.occlusionEnabled = arActive && arOcclusionEnabled   // hide splats behind real geometry
+            settings.depthLinearize = arDepthLinearize
+#endif
             settings.tintColor = controls.tintColor
             settings.tintStrength = Float(controls.tintStrength)
             splat.relightSettings = settings
@@ -449,7 +472,9 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         arFloorPosition = nil
         arModelYaw = .zero
         arModelLengthMeters = 4.5
+        lastTurntableTimestamp = nil
         arActive = false
+        arOcclusionEnabled = false
 #endif
         if let cached = environmentCache[choice] {
             splat.environment = cached
@@ -638,7 +663,18 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let displayToCamera = simd_float3x3(SIMD3<Float>(Float(inverse.a), Float(inverse.b), 0),
                                             SIMD3<Float>(Float(inverse.c), Float(inverse.d), 0),
                                             SIMD3<Float>(Float(inverse.tx), Float(inverse.ty), 1))
-        converter.encode(into: commandBuffer, luma: luma, chroma: chroma,
+
+        // Scene depth (LiDAR) for occlusion; nil on devices without it. Packed into the bg alpha.
+        let depthMap = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
+        let sceneDepth = depthMap.flatMap { depthTexture(from: $0) }
+        arOcclusionEnabled = (sceneDepth != nil)
+        // (A, B) so the resolve maps a splat's NDC depth to meters: depth = B / (A - ndc).
+        let projection = frame.camera.projectionMatrix(for: currentInterfaceOrientation(),
+                                                       viewportSize: viewportSize, zNear: 0.01, zFar: 100)
+        let wz = projection.columns.2.w
+        arDepthLinearize = abs(wz) > 1e-6 ? SIMD2(projection.columns.2.z / wz, projection.columns.3.z / wz) : .zero
+
+        converter.encode(into: commandBuffer, luma: luma, chroma: chroma, sceneDepth: sceneDepth,
                          displayToCamera: displayToCamera, destination: destination)
         return destination
     }
@@ -668,6 +704,22 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         var cvTexture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer,
                                                                nil, format, width, height, plane, &cvTexture)
+        guard status == kCVReturnSuccess, let cvTexture,
+              let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
+        return texture
+    }
+
+    /// Wraps an ARKit scene-depth buffer (single-plane Float32 meters) as an `.r32Float` MTLTexture.
+    private func depthTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
+        if cameraTextureCache == nil {
+            CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cameraTextureCache)
+        }
+        guard let cache = cameraTextureCache else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        var cvTexture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer,
+                                                               nil, .r32Float, width, height, 0, &cvTexture)
         guard status == kCVReturnSuccess, let cvTexture,
               let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
         return texture
@@ -717,6 +769,8 @@ final class RelightControls {
     /// Configurator repaint: paint color (linear RGB) and strength (0 = original color, 1 = full repaint).
     var tintColor: SIMD3<Float> = SIMD3(1, 1, 1)
     var tintStrength: Double = 0
+    /// Hands-free showcase: slowly auto-rotate the AR-placed model (turntable). Drag still adjusts it.
+    var turntable: Bool = false
     /// Scales the sampled environment radiance.
     var environmentIntensity: Double = 1.0
     /// 0 shaded, 1 normal, 2 roughness, 3 reflectionStrength, 4 prefiltered environment.
@@ -918,6 +972,9 @@ struct RelightControlsView: View {
                                 }
                             }
 
+                            Toggle("Turntable (AR)", isOn: $controls.turntable)
+                                .font(.caption)
+
                             Picker("Debug", selection: $controls.debugMode) {
                                 Text("Shaded").tag(0)
                                 Text("Normal").tag(1)
@@ -1010,6 +1067,9 @@ final class ARRoomProbeProvider: NSObject, ARSessionDelegate {
         let configuration = ARWorldTrackingConfiguration()
         configuration.environmentTexturing = .automatic
         configuration.planeDetection = [.horizontal]   // floor/table detection for placing the model
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            configuration.frameSemantics.insert(.smoothedSceneDepth)   // LiDAR depth for occlusion
+        }
         session.delegate = self
         session.run(configuration)
         isRunning = true

@@ -75,6 +75,9 @@ reuses the same deferred-relighting pipeline:
   in meters, so it appears life-size; pinch resizes and drag spins it.
 - A soft elliptical **contact shadow** (sized to the model's footprint) is blended onto the floor under
   the model before the splats composite over it, so it reads as grounded rather than floating.
+- **Depth occlusion** (LiDAR): the scene depth is packed into the camera background's alpha, and the
+  resolve hides splat pixels that sit behind the real world — so a person or furniture in front
+  correctly occludes the object. Falls back to no occlusion on non-LiDAR devices.
 
 A note on correctness: a single rear camera only sees its frustum, so reflections of directions behind
 the camera can't be measured — ARKit fills those in with machine-learning estimation. This reads well on

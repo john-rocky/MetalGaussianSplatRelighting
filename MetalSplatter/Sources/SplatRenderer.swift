@@ -118,8 +118,8 @@ public final class SplatRenderer: @unchecked Sendable {
         var reflectionStrengthOverride: Float
         var screenSize: SIMD2<Float> = .zero
         var arBackground: UInt32 = 0
-        var _pad0: UInt32 = 0
-        var _pad1: SIMD2<Float> = .zero
+        var occlusionEnabled: UInt32 = 0
+        var depthLinearize: SIMD2<Float> = .zero
         var tint: SIMD4<Float> = .zero
     }
 
@@ -137,6 +137,11 @@ public final class SplatRenderer: @unchecked Sendable {
         /// When true, splats composite over `arBackgroundTexture` (the live AR camera image) instead
         /// of the equirect skybox. Requires `arBackgroundTexture` to be set.
         public var arBackground: Bool = false
+        /// Depth occlusion (AR): hide splats behind the real-world scene depth carried in
+        /// `arBackgroundTexture`'s alpha. `depthLinearize` = (A, B) derived from the projection so the
+        /// shader maps a splat's NDC depth to meters as `B / (A - ndc)`.
+        public var occlusionEnabled: Bool = false
+        public var depthLinearize: SIMD2<Float> = .zero
         /// Configurator repaint: recolor the model to `tintColor` (linear RGB), preserving shading.
         /// `tintStrength` 0 = original color, 1 = full repaint.
         public var tintColor: SIMD3<Float> = SIMD3(1, 1, 1)
@@ -397,6 +402,8 @@ public final class SplatRenderer: @unchecked Sendable {
                                reflectionStrengthOverride: relightSettings.reflectionStrengthOverride,
                                screenSize: screenSize,
                                arBackground: useARBackground ? 1 : 0,
+                               occlusionEnabled: (useARBackground && relightSettings.occlusionEnabled) ? 1 : 0,
+                               depthLinearize: relightSettings.depthLinearize,
                                tint: SIMD4<Float>(relightSettings.tintColor, relightSettings.tintStrength))
     }
 

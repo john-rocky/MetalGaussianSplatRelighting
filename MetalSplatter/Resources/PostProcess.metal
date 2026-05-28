@@ -172,6 +172,7 @@ vertex PPVertexOut arCameraVertexShader(uint vertexID [[vertex_id]]) {
 fragment float4 arCameraBackground(PPVertexOut in [[stage_in]],
                                    texture2d<float> lumaTex [[texture(0)]],
                                    texture2d<float> chromaTex [[texture(1)]],
+                                   texture2d<float> sceneDepth [[texture(2)]],
                                    constant ARCameraUniforms &u [[buffer(0)]]) {
     float2 imageUV = (u.displayToCamera * float3(in.uv, 1.0)).xy;
     float y = lumaTex.sample(ppLinearSampler, imageUV).r;
@@ -184,7 +185,10 @@ fragment float4 arCameraBackground(PPVertexOut in [[stage_in]],
     float3 rgb = saturate((ycbcrToRGB * float4(y, cbcr, 1.0f)).rgb);
     // sRGB (display) -> linear, so the camera composites correctly in the linear-HDR pipeline.
     float3 lin = select(rgb / 12.92f, pow((rgb + 0.055f) / 1.055f, float3(2.4f)), rgb > 0.04045f);
-    return float4(lin, 1.0f);
+    // Pack the AR scene depth (meters, camera Z) into alpha for the splat resolve's depth occlusion;
+    // 0 where there is no LiDAR depth.
+    float depthMeters = sceneDepth.sample(ppLinearSampler, imageUV).r;
+    return float4(lin, depthMeters);
 }
 
 // MARK: - AR ground contact shadow

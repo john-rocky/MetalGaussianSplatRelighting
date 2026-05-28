@@ -198,10 +198,13 @@ half4 resolveRelight(FragmentValues v,
     // the splat composites over the real room; otherwise the equirect skybox is reconstructed by ray.
     bool showBg = (relight.enabled != 0 && relight.debugMode == 0);
     half3 bg = half3(0.0h);
+    float sceneDepthM = -1.0f;   // AR scene depth (meters) at this pixel, packed in the camera alpha
     if (showBg) {
         if (relight.arBackground != 0) {
             float2 uv = fragCoord.xy / max(relight.screenSize, float2(1.0f));
-            bg = half3(arCameraImage.sample(arBgSampler, uv).rgb);
+            float4 cam = arCameraImage.sample(arBgSampler, uv);
+            bg = half3(cam.rgb);
+            sceneDepthM = cam.a;
         } else {
             bg = half3(skyboxColor(fragCoord, relight, environmentEquirect));
         }
@@ -235,8 +238,17 @@ half4 resolveRelight(FragmentValues v,
     if (relight.debugMode != 0) {
         return half4(shaded * coverage, coverage);   // debug channels: premultiplied, transparent bg
     }
+    // Depth occlusion: where the real world (AR scene depth) is in front of this splat pixel, suppress
+    // the splat so the camera shows through. Splat NDC depth -> meters via depthLinearize, then compare.
+    half effectiveCoverage = coverage;
+    if (relight.occlusionEnabled != 0u && sceneDepthM > 0.01f) {
+        float splatNDC = float(v.depth) / float(coverage);
+        float splatDepthM = relight.depthLinearize.y / max(relight.depthLinearize.x - splatNDC, 1e-4f);
+        float occlusion = smoothstep(0.0f, 0.05f, splatDepthM - sceneDepthM);   // 1 = real world in front
+        effectiveCoverage = coverage * half(1.0f - occlusion);
+    }
     // Shaded splats composited over the background (skybox or AR camera; opaque result).
-    return half4(shaded * coverage + bg * (1.0h - coverage), 1.0h);
+    return half4(shaded * effectiveCoverage + bg * (1.0h - effectiveCoverage), 1.0h);
 }
 
 /// Generate a single triangle covering the entire screen
