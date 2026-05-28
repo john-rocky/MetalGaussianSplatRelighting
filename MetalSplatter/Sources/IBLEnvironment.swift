@@ -9,8 +9,8 @@ import Foundation
 /// via `MTKTextureLoader`. The maps are built once, on the GPU, at init.
 public final class IBLEnvironment: @unchecked Sendable {
     public enum Constants {
-        public static let baseCubeSize = 256
-        public static let prefilteredCubeSize = 128
+        public static let baseCubeSize = 512
+        public static let prefilteredCubeSize = 256
         /// Number of roughness levels stored across the prefiltered cubemap's mips (roughness 0...1).
         public static let prefilteredMipCount = 6
         public static let irradianceCubeSize = 32
