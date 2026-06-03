@@ -42,7 +42,13 @@ struct ContentView: View {
         NavigationStack(path: $navigationPath) {
             mainView
                 .navigationDestination(for: ModelIdentifier.self) { modelIdentifier in
-                    if case .captureAndTrain(let mode) = modelIdentifier {
+                    if case .captureAndTrain(.object) = modelIdentifier {
+                        // Object capture is delegated to Apple's ObjectCaptureSession +
+                        // PhotogrammetrySession → USDZ pipeline; see AppleObjectCaptureFlow.
+                        AppleObjectCaptureFlow(navigationPath: $navigationPath)
+                            .navigationTitle(modelIdentifier.description)
+                    } else if case .captureAndTrain(let mode) = modelIdentifier {
+                        // Room captures continue to use the msplat training pipeline.
                         CaptureFlowView(mode: mode, navigationPath: $navigationPath)
                             .navigationTitle(modelIdentifier.description)
                     } else {

@@ -28,6 +28,7 @@
 		61E963922F46D321002AD4B5 /* ProceduralSplatController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61E963912F46D321002AD4B5 /* ProceduralSplatController.swift */; };
 		A1B2C3D4E5F6000200000002 /* GaussianCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6000200000001 /* GaussianCapture.swift */; };
 		A1B2C3D4E5F6000200000004 /* CaptureFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6000200000003 /* CaptureFlowView.swift */; };
+		A1B2C3D4E5F6000200000006 /* AppleObjectCaptureFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6000200000005 /* AppleObjectCaptureFlow.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -49,6 +50,7 @@
 		61E963912F46D321002AD4B5 /* ProceduralSplatController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProceduralSplatController.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F6000200000001 /* GaussianCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GaussianCapture.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F6000200000003 /* CaptureFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureFlowView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F6000200000005 /* AppleObjectCaptureFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleObjectCaptureFlow.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -89,6 +91,7 @@
 				61791E142B42294700302B57 /* MetalKitSceneView.swift */,
 				61791E0C2B41683500302B57 /* VisionSceneRenderer.swift */,
 				A1B2C3D4E5F6000200000003 /* CaptureFlowView.swift */,
+				A1B2C3D4E5F6000200000005 /* AppleObjectCaptureFlow.swift */,
 			);
 			path = Scene;
 			sourceTree = "<group>";
@@ -234,6 +237,7 @@
 				610347DC2B46875A00693CE3 /* ContentStageConfiguration.swift in Sources */,
 				A1B2C3D4E5F6000200000002 /* GaussianCapture.swift in Sources */,
 				A1B2C3D4E5F6000200000004 /* CaptureFlowView.swift in Sources */,
+				A1B2C3D4E5F6000200000006 /* AppleObjectCaptureFlow.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
