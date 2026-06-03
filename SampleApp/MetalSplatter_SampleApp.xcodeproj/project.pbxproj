@@ -19,12 +19,15 @@
 		61791DEA2B4154FB00302B57 /* MatrixMathUtil.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61791DDF2B4154FB00302B57 /* MatrixMathUtil.swift */; };
 		61791E002B415D3F00302B57 /* MetalSplatter in Frameworks */ = {isa = PBXBuildFile; productRef = 61791DFF2B415D3F00302B57 /* MetalSplatter */; };
 		61791E022B415D3F00302B57 /* SampleBoxRenderer in Frameworks */ = {isa = PBXBuildFile; productRef = 61791E012B415D3F00302B57 /* SampleBoxRenderer */; };
+		A1B2C3D4E5F600010000000C /* Msplat in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F600010000000B /* Msplat */; };
 		61791E102B41688000302B57 /* MetalKitSceneRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61791E0E2B41685800302B57 /* MetalKitSceneRenderer.swift */; };
 		61791E132B416DD700302B57 /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61791E112B416DCF00302B57 /* Constants.swift */; };
 		61791E162B42297B00302B57 /* MetalKitSceneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61791E142B42294700302B57 /* MetalKitSceneView.swift */; };
 		617E50C92B314C4800F99766 /* PLYIO in Frameworks */ = {isa = PBXBuildFile; productRef = 617E50C82B314C4800F99766 /* PLYIO */; };
 		617E50CB2B314C4800F99766 /* SplatIO in Frameworks */ = {isa = PBXBuildFile; productRef = 617E50CA2B314C4800F99766 /* SplatIO */; };
 		61E963922F46D321002AD4B5 /* ProceduralSplatController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61E963912F46D321002AD4B5 /* ProceduralSplatController.swift */; };
+		A1B2C3D4E5F6000200000002 /* GaussianCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6000200000001 /* GaussianCapture.swift */; };
+		A1B2C3D4E5F6000200000004 /* CaptureFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6000200000003 /* CaptureFlowView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +47,8 @@
 		61791E142B42294700302B57 /* MetalKitSceneView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MetalKitSceneView.swift; sourceTree = "<group>"; };
 		617E50B02B314BE200F99766 /* MetalSplatter SampleApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "MetalSplatter SampleApp.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		61E963912F46D321002AD4B5 /* ProceduralSplatController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProceduralSplatController.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F6000200000001 /* GaussianCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GaussianCapture.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F6000200000003 /* CaptureFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureFlowView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -55,6 +60,7 @@
 				617E50C92B314C4800F99766 /* PLYIO in Frameworks */,
 				61791E002B415D3F00302B57 /* MetalSplatter in Frameworks */,
 				61791E022B415D3F00302B57 /* SampleBoxRenderer in Frameworks */,
+				A1B2C3D4E5F600010000000C /* Msplat in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -69,6 +75,7 @@
 				61791DDE2B4154FB00302B57 /* ModelRenderer.swift */,
 				61791DDC2B4154FB00302B57 /* SampleBoxRenderer+ModelRenderer.swift */,
 				61791DDA2B4154FB00302B57 /* SplatRenderer+ModelRenderer.swift */,
+				A1B2C3D4E5F6000200000001 /* GaussianCapture.swift */,
 			);
 			path = Model;
 			sourceTree = "<group>";
@@ -81,6 +88,7 @@
 				61791E0E2B41685800302B57 /* MetalKitSceneRenderer.swift */,
 				61791E142B42294700302B57 /* MetalKitSceneView.swift */,
 				61791E0C2B41683500302B57 /* VisionSceneRenderer.swift */,
+				A1B2C3D4E5F6000200000003 /* CaptureFlowView.swift */,
 			);
 			path = Scene;
 			sourceTree = "<group>";
@@ -152,6 +160,7 @@
 				617E50CA2B314C4800F99766 /* SplatIO */,
 				61791DFF2B415D3F00302B57 /* MetalSplatter */,
 				61791E012B415D3F00302B57 /* SampleBoxRenderer */,
+				A1B2C3D4E5F600010000000B /* Msplat */,
 			);
 			productName = "MetalSplatter SampleApp";
 			productReference = 617E50B02B314BE200F99766 /* MetalSplatter SampleApp.app */;
@@ -183,6 +192,7 @@
 			mainGroup = 61E3FD792AE5CB0200032652;
 			packageReferences = (
 				61791DFE2B415D3F00302B57 /* XCLocalSwiftPackageReference ".." */,
+				A1B2C3D4E5F600010000000A /* XCLocalSwiftPackageReference "../../msplat/swift" */,
 			);
 			productRefGroup = 61E3FD832AE5CB0200032652 /* Products */;
 			projectDirPath = "";
@@ -222,6 +232,8 @@
 				61791E132B416DD700302B57 /* Constants.swift in Sources */,
 				61791E162B42297B00302B57 /* MetalKitSceneView.swift in Sources */,
 				610347DC2B46875A00693CE3 /* ContentStageConfiguration.swift in Sources */,
+				A1B2C3D4E5F6000200000002 /* GaussianCapture.swift in Sources */,
+				A1B2C3D4E5F6000200000004 /* CaptureFlowView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -451,6 +463,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ..;
 		};
+		A1B2C3D4E5F600010000000A /* XCLocalSwiftPackageReference "../../msplat/swift" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../msplat/swift;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -469,6 +485,11 @@
 		617E50CA2B314C4800F99766 /* SplatIO */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = SplatIO;
+		};
+		A1B2C3D4E5F600010000000B /* Msplat */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1B2C3D4E5F600010000000A /* XCLocalSwiftPackageReference "../../msplat/swift" */;
+			productName = Msplat;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

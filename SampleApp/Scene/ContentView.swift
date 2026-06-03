@@ -42,14 +42,19 @@ struct ContentView: View {
         NavigationStack(path: $navigationPath) {
             mainView
                 .navigationDestination(for: ModelIdentifier.self) { modelIdentifier in
-                    MetalKitSceneView(modelIdentifier: modelIdentifier, relightControls: relightControls)
-                        .navigationTitle(modelIdentifier.description)
-                        .overlay(alignment: .bottom) {
-                            if case .gaussianSplat = modelIdentifier {
-                                RelightControlsView(controls: relightControls)
-                                    .padding()
+                    if case .captureAndTrain(let mode) = modelIdentifier {
+                        CaptureFlowView(mode: mode, navigationPath: $navigationPath)
+                            .navigationTitle(modelIdentifier.description)
+                    } else {
+                        MetalKitSceneView(modelIdentifier: modelIdentifier, relightControls: relightControls)
+                            .navigationTitle(modelIdentifier.description)
+                            .overlay(alignment: .bottom) {
+                                if case .gaussianSplat = modelIdentifier {
+                                    RelightControlsView(controls: relightControls)
+                                        .padding()
+                                }
                             }
-                        }
+                    }
                 }
         }
 #endif // os(iOS)
@@ -93,6 +98,22 @@ struct ContentView: View {
                     break
                 }
             }
+
+#if os(iOS)
+            Button("Capture Room (AR)") {
+                openWindow(value: ModelIdentifier.captureAndTrain(.room))
+            }
+            .padding()
+            .buttonStyle(.borderedProminent)
+            .disabled(!ARCaptureController.isSupported)
+
+            Button("Capture Object (AR)") {
+                openWindow(value: ModelIdentifier.captureAndTrain(.object))
+            }
+            .padding()
+            .buttonStyle(.borderedProminent)
+            .disabled(!ARCaptureController.isSupported)
+#endif
 
             Button("Procedural Splat") {
                 openWindow(value: ModelIdentifier.proceduralSplat)

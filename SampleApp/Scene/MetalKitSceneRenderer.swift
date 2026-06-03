@@ -224,6 +224,9 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                    sampleCount: metalKitView.sampleCount,
                                                    maxViewCount: 1,
                                                    maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+        case .captureAndTrain:
+            // Routed to CaptureFlowView in ContentView's navigationDestination; never reached here.
+            break
         case .none:
             break
         }

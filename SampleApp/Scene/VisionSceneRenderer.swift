@@ -100,6 +100,9 @@ final class VisionSceneRenderer: @unchecked Sendable {
                                                   sampleCount: 1,
                                                   maxViewCount: layerRenderer.properties.viewCount,
                                                   maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+        case .captureAndTrain:
+            // iOS-only feature; never reached on visionOS.
+            break
         case .none:
             break
         }
