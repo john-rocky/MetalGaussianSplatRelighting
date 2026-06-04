@@ -31,6 +31,12 @@ public struct SplatChunk: @unchecked Sendable {
     /// `nil` if this chunk carries no material.
     public let materials: MetalBuffer<EncodedSplatMaterial>?
 
+    /// Optional buffer of per-splat Ref-Gaussian ASG (Anisotropic Spherical Gaussian) indirect
+    /// coefficients: 160 Float16 per splat (32 lobes × 5 channels, lobe-major). `nil` for any
+    /// scene that wasn't trained with the ASG-indirect head. ~320 bytes/splat → ~64 MB for a
+    /// 200k-splat scene.
+    public let asgCoefficients: MetalBuffer<Float16>?
+
     /// The spherical harmonics degree for this chunk.
     /// All splats in a chunk share the same SH degree.
     public let shDegree: SHDegree
@@ -46,10 +52,12 @@ public struct SplatChunk: @unchecked Sendable {
     public init(splats: MetalBuffer<EncodedSplatPoint>,
                 shCoefficients: MetalBuffer<Float16>? = nil,
                 materials: MetalBuffer<EncodedSplatMaterial>? = nil,
+                asgCoefficients: MetalBuffer<Float16>? = nil,
                 shDegree: SHDegree = .sh0) {
         self.splats = splats
         self.shCoefficients = shCoefficients
         self.materials = materials
+        self.asgCoefficients = asgCoefficients
         self.shDegree = shDegree
     }
 
@@ -91,6 +99,32 @@ public struct SplatChunk: @unchecked Sendable {
             materialBuffer.values[i] = material
         }
         self.materials = materialBuffer
+
+        // Build the ASG buffer iff any point carries an ASG tail. One-shot: we either have it for
+        // every splat (Ref-Gaussian relightable scene) or for none (standard 3DGS / older
+        // checkpoints). 160 fp16 per splat, lobe-major (5 floats per lobe).
+        let asgCount = 160
+        if points.first?.material?.indirectASG?.count == asgCount {
+            let asgBuffer = try MetalBuffer<Float16>(device: device, capacity: points.count * asgCount)
+            asgBuffer.count = points.count * asgCount
+            for (i, point) in points.enumerated() {
+                guard let asg = point.material?.indirectASG, asg.count == asgCount else {
+                    // Defensive: if a point inside the chunk is missing its ASG tail, fill with
+                    // zeros so the shader's exp(ep - 3) -> exp(-3) ~= 0.05 stays bounded but
+                    // doesn't blow up reflections.
+                    let base = i * asgCount
+                    for j in 0..<asgCount { asgBuffer.values[base + j] = 0 }
+                    continue
+                }
+                let base = i * asgCount
+                for j in 0..<asgCount {
+                    asgBuffer.values[base + j] = Float16(asg[j])
+                }
+            }
+            self.asgCoefficients = asgBuffer
+        } else {
+            self.asgCoefficients = nil
+        }
 
         // Create SH coefficient buffer if we have higher-order SH
         if shDegree > .sh0 {

@@ -221,15 +221,23 @@ public struct SplatPoint: Sendable {
         public var reflectionStrength: Float
         /// Specular tint / F0 color in [0, 1] (Ref-Gaussian `ori_color`).
         public var specularTint: SIMD3<Float>
+        /// Ref-Gaussian ASG (Anisotropic Spherical Gaussian) indirect coefficients, 32 lobes ×
+        /// 5 channels (ep_rgb, λ, μ). Lobe-major layout: indices `5*k .. 5*k+4` are
+        /// (ep_r, ep_g, ep_b, λ, μ) for lobe k. Lobe directions are fixed constants from
+        /// `init_predefined_omega(4, 8)` — recomputed on the GPU, not stored here. `nil` for
+        /// non-Ref-Gaussian scenes or relightable scenes without the ASG tail (a small minority).
+        public var indirectASG: [Float]?
 
         public init(normal: SIMD3<Float>,
                     roughness: Float,
                     reflectionStrength: Float,
-                    specularTint: SIMD3<Float>) {
+                    specularTint: SIMD3<Float>,
+                    indirectASG: [Float]? = nil) {
             self.normal = normal
             self.roughness = roughness
             self.reflectionStrength = reflectionStrength
             self.specularTint = specularTint
+            self.indirectASG = indirectASG
         }
     }
 

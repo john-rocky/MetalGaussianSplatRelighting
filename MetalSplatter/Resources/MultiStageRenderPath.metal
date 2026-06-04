@@ -10,6 +10,7 @@ typedef struct
     half4 normalRough [[raster_order_group(0)]];   // rgb: normal * w,  a: roughness * w
     half4 viewRefl [[raster_order_group(0)]];      // rgb: viewDir * w, a: reflectionStrength * w
     half4 oriColor [[raster_order_group(0)]];      // rgb: ori_color (albedo/F0 tint) * w, a: unused
+    half3 indirect [[raster_order_group(0)]];      // Ref-Gaussian ASG indirect radiance * w (zero when ASG disabled / absent)
     half materialWeight [[raster_order_group(0)]]; // accumulated alpha weight (normalizes normal/material); == coverage
     float depth [[raster_order_group(0)]];
 } FragmentValues;
@@ -32,8 +33,71 @@ kernel void initializeFragmentStore(imageblock<FragmentValues, imageblock_layout
     values->normalRough = { 0, 0, 0, 0 };
     values->viewRefl = { 0, 0, 0, 0 };
     values->oriColor = { 0, 0, 0, 0 };
+    values->indirect = { 0, 0, 0 };
     values->materialWeight = 0;
     values->depth = 0;
+}
+
+// Transpose of Ref-Gaussian's `rotation_between_z(N)` (utils/graphics_utils.py): applied to `v`,
+// it expresses `v` in the local frame where the +Z axis aligns with `N`. The closed-form formula
+// avoids any explicit basis construction (and the discontinuity that picking an arbitrary tangent
+// would introduce); the only singular case is N pointing straight down, where the matrix becomes
+// a 180° flip.
+static float3 worldToLocalAlignedToZ(float3 N, float3 v) {
+    if (N.z < -0.999999f) return -v;
+    float inv = 1.0f / (N.z + 1.0f);
+    float nxx = N.x * N.x * inv;
+    float nyy = N.y * N.y * inv;
+    float nxy = N.x * N.y * inv;
+    float vx = (1.0f - nxx) * v.x + (-nxy) * v.y + (-N.x) * v.z;
+    float vy = (-nxy) * v.x + (1.0f - nyy) * v.y + (-N.y) * v.z;
+    float vz = N.x * v.x + N.y * v.y + N.z * v.z;
+    return float3(vx, vy, vz);
+}
+
+// Evaluate Ref-Gaussian's 32-lobe ASG indirect term in the normal-aligned local frame. Each lobe
+// k = i*8 + j has a principal direction ω, anisotropy axes ω_λ, ω_μ, and trained per-channel
+// params (ep_rgb, λ, μ). See utils/graphics_utils.py `init_predefined_omega(4, 8)` for the lobe
+// layout and gaussian_renderer/__init__.py:284-295 for the math.
+//
+//   ω      = (cos φ sin θ, sin φ sin θ, cos θ)
+//   ω_λ    = (cos φ cos θ, sin φ cos θ, -sin θ)        (= ω rotated +π/2 in θ)
+//   ω_μ    = (-sin φ, cos φ, 0)                        (= ω × ω_λ)
+//   ep_c   = exp(asg[ch] - 3)                         (per-channel RGB intensity)
+//   λ      = softplus(asg[3] - 1), μ = softplus(asg[4] - 1)
+//   lobe_k = ep * relu(ω · R) * exp(-λ (ω_λ · R)² - μ (ω_μ · R)²)
+//   I      = max(Σ lobe_k, 0)
+static half3 evaluateASG(device const half* asg, float3 reflLocal) {
+    float3 indirect = float3(0.0f);
+    for (uint i = 0; i < 4; i++) {
+        float theta = (float(i) + 0.5f) * (M_PI_F / 8.0f);
+        float sinT, cosT;
+        sinT = sincos(theta, cosT);
+        for (uint j = 0; j < 8; j++) {
+            float phi = (float(j) + 0.5f) * (M_PI_F / 4.0f);
+            float sinP, cosP;
+            sinP = sincos(phi, cosP);
+
+            float3 omega   = float3(cosP * sinT, sinP * sinT, cosT);
+            float3 omegaLa = float3(cosP * cosT, sinP * cosT, -sinT);
+            float3 omegaMu = float3(-sinP, cosP, 0.0f);
+
+            uint k = i * 8u + j;
+            device const half* base = asg + 5u * k;
+            float3 ep = float3(exp(float(base[0]) - 3.0f),
+                               exp(float(base[1]) - 3.0f),
+                               exp(float(base[2]) - 3.0f));
+            float la = log(1.0f + exp(float(base[3]) - 1.0f));
+            float mu = log(1.0f + exp(float(base[4]) - 1.0f));
+
+            float smoothK = max(dot(omega, reflLocal), 0.0f);
+            float dotLa = dot(omegaLa, reflLocal);
+            float dotMu = dot(omegaMu, reflLocal);
+            float gain = smoothK * exp(-la * dotLa * dotLa - mu * dotMu * dotMu);
+            indirect += ep * gain;
+        }
+    }
+    return half3(max(indirect, 0.0f));
 }
 
 vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
@@ -41,7 +105,8 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
                                               ushort amplificationID [[amplification_id]],
                                               device const ChunkInfo* chunks [[ buffer(BufferIndexChunks) ]],
                                               constant ChunkedSplatIndex* splatIndexArray [[ buffer(BufferIndexSplatIndex) ]],
-                                              constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]]) {
+                                              constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]],
+                                              constant RelightUniforms & relight [[ buffer(BufferIndexRelight) ]]) {
     Uniforms uniforms = uniformsArray.uniforms[min(int(amplificationID), kMaxViewCount)];
 
     uint splatID = instanceID * uniforms.indexedSplatCount + (vertexID / 4);
@@ -84,6 +149,7 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
     // Deferred relighting: pass the per-splat material through to the G-buffer. Split-sum shading
     // runs per pixel in the postprocess pass, after normals are blended (camera-facing only).
     // Normals are oriented consistently outward at load time, so dot(N, V) > 0 means front-facing.
+    half3 gIndirect = half3(0);
     if (chunk.materials != nullptr) {
         SplatMaterial material = chunk.materials[idx.splatIndex];
         float3 N = normalize(float3(material.normal));
@@ -92,12 +158,26 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
         out.gView = half3(V);
         out.gMaterial = half2(material.roughness, material.reflectionStrength);
         out.gOriColor = half3(material.specularTint);
+
+        // Ref-Gaussian ASG indirect: rotate the world-space reflection vector into the splat's
+        // normal-aligned local frame (same convention as `rotation_between_z(N)^T` in the paper)
+        // and evaluate the 32-lobe ASG sum. Skip when the toggle is off OR the chunk wasn't
+        // trained with the ASG tail — N flipping below uses the same faceforward as the normal
+        // composite to stay consistent with the material weight downstream.
+        if (relight.asgEnabled != 0u && chunk.asg != nullptr) {
+            float facing = (dot(N, V) < 0.0f) ? -1.0f : 1.0f;
+            float3 Nf = N * facing;
+            float3 reflW = reflect(-V, Nf);
+            float3 reflLocal = worldToLocalAlignedToZ(Nf, reflW);
+            gIndirect = evaluateASG(chunk.asg + 160u * idx.splatIndex, reflLocal);
+        }
     } else {
         out.gNormal = half3(0, 0, 1);
         out.gView = half3(0, 0, 1);
         out.gMaterial = half2(0.5h, 0.0h);
         out.gOriColor = half3(1, 1, 1);
     }
+    out.gIndirect = gIndirect;
 
     return out;
 }
@@ -123,6 +203,7 @@ fragment FragmentStore multiStageSplatFragmentShader(FragmentIn in [[stage_in]],
     out.values.normalRough = previousFragmentValues.normalRough * oneMinusAlpha + half4(viewNormal * w, in.gMaterial.x * w);
     out.values.viewRefl = previousFragmentValues.viewRefl * oneMinusAlpha + half4(in.gView * w, in.gMaterial.y * w);
     out.values.oriColor = previousFragmentValues.oriColor * oneMinusAlpha + half4(in.gOriColor * w, 0.0h);
+    out.values.indirect = previousFragmentValues.indirect * oneMinusAlpha + in.gIndirect * w;
     out.values.materialWeight = previousFragmentValues.materialWeight * oneMinusAlpha + w;
 
     float previousDepth = previousFragmentValues.depth;
@@ -233,7 +314,11 @@ half4 resolveRelight(FragmentValues v,
     float3 V = normalize(float3(v.viewRefl.rgb));
     float roughness = float(v.normalRough.a) * invMW;
     float reflStrength = float(v.viewRefl.a) * invMW;
-    half3 shaded = shadeIBLDeferred(baseColor, oriColor, N, V, roughness, reflStrength,
+    // ASG indirect is weighted-summed in the imageblock the same way as the other material
+    // channels; recover the per-pixel mean by dividing by materialWeight. Zero when the chunk
+    // carries no ASG tail (vertex shader emits gIndirect = 0 in that case).
+    half3 indirectBlended = half3(float3(v.indirect) * invMW);
+    half3 shaded = shadeIBLDeferred(baseColor, oriColor, indirectBlended, N, V, roughness, reflStrength,
                                     relight, prefilteredEnv, irradianceEnv, brdfLUT, iblSampler);
     if (relight.debugMode != 0) {
         return half4(shaded * coverage, coverage);   // debug channels: premultiplied, transparent bg

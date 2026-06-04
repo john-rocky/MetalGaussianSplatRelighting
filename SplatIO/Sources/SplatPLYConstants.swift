@@ -37,5 +37,13 @@ struct SplatPLYConstants {
         static let normal2X = [ "nx2" ]
         static let normal2Y = [ "ny2" ]
         static let normal2Z = [ "nz2" ]
+
+        // Ref-Gaussian ASG (Anisotropic Spherical Gaussian) indirect-illumination params.
+        // 160 floats per splat = 32 lobes × 5 channels. Stored channel-major (PyTorch
+        // `_indirect_asg.transpose(1,2).flatten` from gaussian_model.py): properties 0–31 are
+        // ep_r across all 32 lobes, 32–63 ep_g, 64–95 ep_b, 96–127 λ, 128–159 μ.
+        static let indASGPrefix = "ind_asg_"
+        static let indASGCount = 160
+        static let indASGLobeCount = 32
     }
 }

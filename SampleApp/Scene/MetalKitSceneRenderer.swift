@@ -420,6 +420,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 #endif
             settings.tintColor = controls.tintColor
             settings.tintStrength = Float(controls.tintStrength)
+            settings.asgIndirectEnabled = controls.asgIndirectEnabled
+            settings.asgIndirectStrength = Float(controls.asgIndirectStrength)
             splat.relightSettings = settings
         }
 
@@ -772,6 +774,12 @@ final class RelightControls {
     /// Configurator repaint: paint color (linear RGB) and strength (0 = original color, 1 = full repaint).
     var tintColor: SIMD3<Float> = SIMD3(1, 1, 1)
     var tintStrength: Double = 0
+    /// Ref-Gaussian ASG indirect (Stage D): consume the trained `ind_asg` tail (160 floats per
+    /// splat) for per-splat secondary reflections. Only takes effect on scenes that carry the tail.
+    var asgIndirectEnabled: Bool = false
+    /// 0..1 blend factor between the IBL environment specular (direct) and the ASG indirect.
+    /// Stands in for the paper's ray-traced visibility test that isn't feasible on-device.
+    var asgIndirectStrength: Double = 0.5
     /// Hands-free showcase: slowly auto-rotate the AR-placed model (turntable). Drag still adjusts it.
     var turntable: Bool = false
     /// Scales the sampled environment radiance.
@@ -977,6 +985,15 @@ struct RelightControlsView: View {
 
                             Toggle("Turntable (AR)", isOn: $controls.turntable)
                                 .font(.caption)
+
+                            // Ref-Gaussian ASG indirect: consume the trained 160-float ind_asg
+                            // tail to add per-splat secondary reflections (the paper's "indirect
+                            // light" head). Slider stands in for the ray-traced visibility test.
+                            Toggle("ASG indirect", isOn: $controls.asgIndirectEnabled)
+                                .font(.caption)
+                            if controls.asgIndirectEnabled {
+                                labeledSlider("Indirect mix", value: $controls.asgIndirectStrength, range: 0...1)
+                            }
 
                             Picker("Debug", selection: $controls.debugMode) {
                                 Text("Shaded").tag(0)

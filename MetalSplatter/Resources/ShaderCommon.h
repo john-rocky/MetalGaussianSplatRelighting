@@ -90,6 +90,9 @@ typedef struct
     uint occlusionEnabled;                // 1 = occlude splats behind the AR scene depth (packed in arCameraImage.a)
     vector_float2 depthLinearize;         // (A, B): view-space depth = B / (A - ndcDepth); also aligns tint to 16 bytes
     vector_float4 tint;                   // configurator repaint: xyz = paint color (linear), w = strength (0 = original)
+    uint asgEnabled;                      // 1 = evaluate Ref-Gaussian ASG indirect tail and blend it with the direct IBL specular
+    float asgStrength;                    // 0..1 blend factor: specular = direct * (1 - s) + indirect * s
+    vector_float2 _asgPadding;            // keep the struct 16-byte aligned for the next field
 } RelightUniforms;
 
 // Keep in sync with EncodedSplatPoint
@@ -124,6 +127,7 @@ typedef struct
     device Splat* splats;
     device half* shCoefficients;   // Null for SH degree 0, otherwise higher-order SH coefficients
     device SplatMaterial* materials; // Null if this chunk has no relightable material
+    device half* asg;              // Null if no ASG tail; 160 fp16 per splat (lobe-major: 5 floats per lobe)
     uint32_t splatCount;
     SHDegree shDegree;             // Spherical harmonics degree for this chunk
     uint8_t enabled;               // Non-zero = enabled for rendering
@@ -140,4 +144,5 @@ typedef struct
     half3 gView;     // world-space view direction (camera - splat center)
     half2 gMaterial; // (roughness, reflectionStrength)
     half3 gOriColor; // ori_color (Ref-Gaussian albedo / specular F0 tint), in [0,1]
+    half3 gIndirect; // Ref-Gaussian ASG indirect (precomputed in vertex from the splat's 32-lobe params)
 } FragmentIn;

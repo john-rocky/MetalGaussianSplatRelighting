@@ -284,6 +284,7 @@ half3 shadePBR(half3 baseColorLinear,
 
 half3 shadeIBLDeferred(half3 baseColorLinear,
                        half3 oriColorLinear,
+                       half3 indirectASG,
                        float3 N,
                        float3 V,
                        float roughness,
@@ -317,8 +318,14 @@ half3 shadeIBLDeferred(half3 baseColorLinear,
     float3 prefiltered = prefilteredEnv.sample(iblSampler, sampleR, level(mipLevel)).rgb * relight.envIntensity;
     float2 fg = brdfLUT.sample(iblSampler, float2(NdotV, roughness), level(0)).rg;
 
+    // Ref-Gaussian's `specular_light = direct * visibility + (1 - visibility) * indirect`: we can't
+    // compute the per-pixel ray-traced visibility on-device, so the asgStrength slider replaces
+    // it as a global blend factor. Applied at the RADIANCE level (before the BRDF weight) so the
+    // F0 / Fresnel response stays correct — matches the paper's compositing order.
+    float3 specularLight = mix(prefiltered, float3(indirectASG), relight.asgEnabled != 0u ? relight.asgStrength : 0.0f);
+
     float3 F0 = mix(float3(0.04f), oriColor, reflectionStrength);
-    float3 specular = prefiltered * (F0 * fg.x + fg.y);
+    float3 specular = specularLight * (F0 * fg.x + fg.y);
 
     float3 finalColor = (1.0f - reflectionStrength) * baseColor + specular;
 

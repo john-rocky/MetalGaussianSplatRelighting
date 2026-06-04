@@ -95,11 +95,13 @@ public final class SplatRenderer: @unchecked Sendable {
     }
 
     // Keep in sync with Shaders.metal : ChunkInfo
-    // Expected layout: splatsPointer (8), shCoefficientsPointer (8), materialsPointer (8), splatCount (4), shDegree (1), enabled (1), padding (2) = 32 bytes
+    // Expected layout: splatsPointer (8), shCoefficientsPointer (8), materialsPointer (8),
+    //                  asgPointer (8), splatCount (4), shDegree (1), enabled (1), padding (2) = 40 bytes
     struct GPUChunkInfo {
         var splatsPointer: UInt64             // device pointer to splats
         var shCoefficientsPointer: UInt64     // device pointer to SH coefficients (0 for SH0)
         var materialsPointer: UInt64          // device pointer to per-splat materials (0 if none)
+        var asgPointer: UInt64                // device pointer to per-splat 160 fp16 ASG (0 if none)
         var splatCount: UInt32
         var shDegree: UInt8                   // SHDegree enum value
         var enabled: UInt8                    // Non-zero = enabled for rendering
@@ -121,6 +123,9 @@ public final class SplatRenderer: @unchecked Sendable {
         var occlusionEnabled: UInt32 = 0
         var depthLinearize: SIMD2<Float> = .zero
         var tint: SIMD4<Float> = .zero
+        var asgEnabled: UInt32 = 0
+        var asgStrength: Float = 0
+        var _asgPadding: SIMD2<Float> = .zero
     }
 
     /// User-facing relightable-rendering settings. Mutate between frames to control IBL.
@@ -146,6 +151,15 @@ public final class SplatRenderer: @unchecked Sendable {
         /// `tintStrength` 0 = original color, 1 = full repaint.
         public var tintColor: SIMD3<Float> = SIMD3(1, 1, 1)
         public var tintStrength: Float = 0
+        /// Ref-Gaussian ASG indirect: when true and the scene carries an ASG tail, evaluate the
+        /// 32-lobe per-splat indirect specular and blend it into the IBL specular result.
+        public var asgIndirectEnabled: Bool = false
+        /// 0..1 blend factor between IBL direct specular (the environment map) and the ASG
+        /// indirect (the trained per-splat "what the reflection actually sees"). 0 = direct only
+        /// (current behavior), 1 = indirect only. Without an on-device ray-tracer we can't
+        /// reproduce the paper's visibility test exactly, so this slider is the user-facing
+        /// stand-in.
+        public var asgIndirectStrength: Float = 0.5
         public init() {}
     }
 
@@ -404,7 +418,9 @@ public final class SplatRenderer: @unchecked Sendable {
                                arBackground: useARBackground ? 1 : 0,
                                occlusionEnabled: (useARBackground && relightSettings.occlusionEnabled) ? 1 : 0,
                                depthLinearize: relightSettings.depthLinearize,
-                               tint: SIMD4<Float>(relightSettings.tintColor, relightSettings.tintStrength))
+                               tint: SIMD4<Float>(relightSettings.tintColor, relightSettings.tintStrength),
+                               asgEnabled: (active && relightSettings.asgIndirectEnabled) ? 1 : 0,
+                               asgStrength: max(0, min(1, relightSettings.asgIndirectStrength)))
     }
 
     // MARK: - Chunk Management
@@ -794,11 +810,13 @@ public final class SplatRenderer: @unchecked Sendable {
         for (chunkIndex, entry) in allChunks.enumerated() {
             let shPointer = entry.chunk.shCoefficients?.buffer.gpuAddress ?? 0
             let materialsPointer = entry.chunk.materials?.buffer.gpuAddress ?? 0
+            let asgPointer = entry.chunk.asgCoefficients?.buffer.gpuAddress ?? 0
 
             chunksPtr[chunkIndex] = GPUChunkInfo(
                 splatsPointer: entry.chunk.splats.buffer.gpuAddress,
                 shCoefficientsPointer: shPointer,
                 materialsPointer: materialsPointer,
+                asgPointer: asgPointer,
                 splatCount: UInt32(entry.chunk.splatCount),
                 shDegree: entry.chunk.shDegree.rawValue,
                 enabled: entry.isEnabled ? 1 : 0
@@ -1053,6 +1071,9 @@ public final class SplatRenderer: @unchecked Sendable {
             }
             if let materialsBuffer = entry.chunk.materials?.buffer {
                 renderEncoder.useResource(materialsBuffer, usage: .read, stages: .vertex)
+            }
+            if let asgBuffer = entry.chunk.asgCoefficients?.buffer {
+                renderEncoder.useResource(asgBuffer, usage: .read, stages: .vertex)
             }
         }
 

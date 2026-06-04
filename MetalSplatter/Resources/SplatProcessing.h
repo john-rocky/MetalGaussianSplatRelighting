@@ -59,6 +59,7 @@ half3 shadePBR(half3 baseColorLinear,
 /// (ori_color) that tints the specular F0. final = (1 - refl) * base + specular.
 half3 shadeIBLDeferred(half3 baseColorLinear,
                        half3 oriColorLinear,
+                       half3 indirectASG,
                        float3 N,
                        float3 V,
                        float roughness,

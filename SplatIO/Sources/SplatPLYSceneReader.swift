@@ -97,6 +97,10 @@ private struct ElementInputMapping {
         let roughnessIndex: Int
         let specularTintIndices: SIMD3<Int>     // ori_color_0..2
         let normalDeltaIndices: SIMD3<Int>?     // nx/ny/nz residual (nil -> use geometric normal only)
+        /// Property indices for the 160 `ind_asg_*` floats per splat, ordered 0..159 so
+        /// `asgIndices[i]` reads the i-th flat ASG coefficient. `nil` if the scene wasn't trained
+        /// with the ASG-indirect head.
+        let asgIndices: [Int]?
     }
 
     let elementTypeIndex: Int
@@ -192,10 +196,31 @@ private struct ElementInputMapping {
                let nz = try headerElement.index(forOptionalFloat32PropertyNamed: SplatPLYConstants.PropertyName.normalZ) {
                 normalDeltaIndices = SIMD3<Int>(nx, ny, nz)
             }
+            // Detect the ASG indirect tail. Require ALL 160 properties to be present — a partial
+            // tail would silently produce wrong indirect colors, so we'd rather fall back to
+            // direct-only than half-populate.
+            var asgIndices: [Int]? = nil
+            if headerElement.index(forPropertyNamed: "\(SplatPLYConstants.PropertyName.indASGPrefix)0") != nil {
+                var collected: [Int] = []
+                collected.reserveCapacity(SplatPLYConstants.PropertyName.indASGCount)
+                for i in 0..<SplatPLYConstants.PropertyName.indASGCount {
+                    guard let idx = try headerElement.index(forOptionalFloat32PropertyNamed: [
+                        "\(SplatPLYConstants.PropertyName.indASGPrefix)\(i)"
+                    ]) else {
+                        collected.removeAll()
+                        break
+                    }
+                    collected.append(idx)
+                }
+                if collected.count == SplatPLYConstants.PropertyName.indASGCount {
+                    asgIndices = collected
+                }
+            }
             material = MaterialMapping(reflectionStrengthIndex: reflectionStrengthIndex,
                                        roughnessIndex: roughnessIndex,
                                        specularTintIndices: specularTintIndices,
-                                       normalDeltaIndices: normalDeltaIndices)
+                                       normalDeltaIndices: normalDeltaIndices,
+                                       asgIndices: asgIndices)
         } else {
             material = nil
         }
@@ -287,10 +312,28 @@ private extension SplatPoint {
             let normalLength = simd_length(normal)
             let unitNormal = normalLength > 1e-6 ? normal / normalLength : geometricNormal
 
+            // ASG indirect coefficients, remapped from PLY channel-major (all 32 ep_r, then ep_g,
+            // ep_b, λ, μ) to lobe-major (5 consecutive floats per lobe). The shader pulls one
+            // lobe's worth at a time, so co-locating them avoids 5 strided loads per iteration.
+            var asg: [Float]? = nil
+            if let asgIndices = materialMapping.asgIndices {
+                let count = SplatPLYConstants.PropertyName.indASGCount
+                let lobeCount = SplatPLYConstants.PropertyName.indASGLobeCount  // 32
+                var lobeMajor = [Float](repeating: 0, count: count)
+                for ch in 0..<5 {
+                    let base = ch * lobeCount
+                    for k in 0..<lobeCount {
+                        lobeMajor[5 * k + ch] = try element.float32Value(forPropertyIndex: asgIndices[base + k])
+                    }
+                }
+                asg = lobeMajor
+            }
+
             material = SplatPoint.Material(normal: unitNormal,
                                            roughness: roughness,
                                            reflectionStrength: reflectionStrength,
-                                           specularTint: specularTint)
+                                           specularTint: specularTint,
+                                           indirectASG: asg)
         }
     }
 }

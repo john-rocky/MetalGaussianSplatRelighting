@@ -72,6 +72,13 @@ extension SplatChunk {
         if let materialsBuffer = materials {
             materialsBuffer.values.reorderInPlace(fromSourceIndices: sorted)
         }
+
+        // Same correspondence problem as materials: each splat's 160 ASG coefficients must travel
+        // with that splat through the Morton sort, otherwise the shader pulls a different splat's
+        // indirect into this splat's lobes and reflections turn into noise.
+        if let asgBuffer = asgCoefficients {
+            asgBuffer.values.reorderGroupsInPlace(fromSourceIndices: sorted, groupSize: 160)
+        }
     }
 }
 
