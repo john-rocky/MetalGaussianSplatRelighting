@@ -44,17 +44,21 @@ struct CaptureFlowView: View {
     ///     their opacity and the outside-noise splats to fade. Going to 10000 iters fires a
     ///     third reset at 9100 with only 900 iters left to recover, which actually leaves
     ///     genuine splats unfinished.
-    ///   * imageDownscale = 3.0 (vs room's 2.0) cuts image + mask CPU/GPU memory by ~55%
-    ///     (~250MB → ~110MB for 30 sensor-native frames). The trainer still has plenty of
+    ///   * imageDownscale = 3.0 (vs room's 1.5) cuts image + mask CPU/GPU memory by ~75%
+    ///     (~250MB → ~70MB for 30 sensor-native frames). The trainer still has plenty of
     ///     resolution to converge object detail thanks to msplat's coarse-to-fine schedule.
     ///
-    /// Room mode keeps the original 3000 / 2.0 because it doesn't carry masks and tends to
-    /// fit in cap easily.
+    /// Room mode runs 6000 iters at downscale 1.5 — bumped from 3000 / 2.0 once the LiDAR mesh
+    /// init cloud started seeding the trainer with ~20-50k well-placed splats instead of the
+    /// 50-200 sparse feature points; that init density supports a longer densification schedule
+    /// (more rounds before opacity reset) and the lower downscale recovers wall-texture detail
+    /// the trainer was previously losing. Room doesn't carry masks so the memory budget
+    /// comfortably absorbs the extra image resolution.
     init(mode: CaptureMode, navigationPath: Binding<NavigationPath>) {
         self.mode = mode
         self._navigationPath = navigationPath
-        let iters = (mode == .object) ? 8_000 : 3_000
-        let downscale: Float = (mode == .object) ? 3.0 : 2.0
+        let iters = (mode == .object) ? 8_000 : 6_000
+        let downscale: Float = (mode == .object) ? 3.0 : 1.5
         self._training = StateObject(wrappedValue: GaussianTrainingController(
             totalIterations: iters, imageDownscale: downscale))
     }
@@ -111,7 +115,7 @@ struct CaptureFlowView: View {
         VStack {
             Text(mode == .object
                  ? "Orbit the object slowly at several heights — aim for 30+ frames from many angles."
-                 : "Move around the room and tap the shutter from many angles.")
+                 : "Walk slowly around the room — frames are captured automatically. Tap the shutter for extra coverage.")
                 .font(.subheadline)
                 .foregroundStyle(.white)
                 .padding(8)
@@ -234,19 +238,31 @@ struct CaptureFlowView: View {
     }
 
     private func beginTraining() {
-        capture.stop()
         let kfs = capture.keyframes
-        let pts = capture.collectedPoints
+        // Build the room init cloud BEFORE pausing the session — `collectRoomInitCloud` reads
+        // `session.currentFrame.anchors` for the LiDAR mesh, which is only populated while the
+        // session is live. Sparse + mesh + per-keyframe depth voxelized together.
+        let roomInit = capture.collectRoomInitCloud()
+        capture.stop()
         let workDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("capture-\(UUID().uuidString)", isDirectory: true)
         let outputPLY = FileManager.default.temporaryDirectory
             .appendingPathComponent("scene-\(UUID().uuidString).ply")
 
         guard mode == .object else {
-            training.start(keyframes: kfs, points: pts,
+            // Room mode: hand the LiDAR-augmented init cloud to the trainer. Falls back to
+            // sparse-only on non-LiDAR devices because `collectRoomInitCloud` degrades to just
+            // featurePoints when the mesh + depth sources are empty.
+            keptFrames = kfs.count
+            initPointCount = roomInit.points.count
+            initPointSource = roomInit.source
+            training.start(keyframes: kfs, points: roomInit.points,
                            workDir: workDir, outputPLY: outputPLY)
             return
         }
+        // Object mode below keeps using the sparse cloud as a fallback when no LiDAR is
+        // available; ObjectMaskProcessor still drives the dense in-object seed.
+        let pts = capture.collectedPoints
 
         // Object mode: isolate the foreground in each frame and bake a white background, then
         // train with bgColor=white so empty regions match the masked input — splats only grow

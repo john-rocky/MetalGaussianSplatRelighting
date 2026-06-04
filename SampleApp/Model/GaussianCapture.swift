@@ -85,23 +85,106 @@ final class ARCaptureController: ObservableObject {
     private let ciContext = CIContext()
     private var isRunning = false
 
+    // MARK: Auto-capture
+    /// Toggle for the pose-delta auto-capture loop. UI may still expose the manual shutter; the
+    /// two paths are independent and update the same `keyframes` array.
+    @Published var isAutoCaptureEnabled: Bool = true
+    /// Pose of the last captured frame (manual or auto). Auto loop fires when the live camera
+    /// pose has diverged from this by more than the translation / rotation thresholds.
+    private var lastCapturedTransform: simd_float4x4?
+    /// Wall-clock time of the last capture, for the cooldown that prevents bursts on jitter.
+    private var lastCaptureTime: Date?
+    private var autoCaptureTask: Task<Void, Never>?
+    /// 10cm baseline gap: roughly the parallax 3DGS needs to triangulate stable splat positions
+    /// at typical room range (1–4m). Smaller spacings just duplicate views.
+    private let autoCaptureTranslationThreshold: Float = 0.10
+    /// 15° rotational gap: enough to give a distinct viewing angle without flooding from
+    /// hand-shake while standing still.
+    private let autoCaptureRotationThreshold: Float = .pi / 12
+    /// Sanity cap so a long sweep doesn't blow past memory; 100 keyframes at ~150KB JPEG ≈ 15MB
+    /// raw + msplat dataset state stays well within the iPhone process cap.
+    private let autoCaptureMaxKeyframes = 100
+    /// Cooldown so we don't double-fire while the pose change is being processed.
+    private let autoCaptureCooldown: TimeInterval = 0.4
+
     func start() {
         guard Self.isSupported, !isRunning else { return }
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
         // Enable LiDAR depth (no-op on non-LiDAR devices). Object mode unprojects masked depth
-        // pixels per keyframe to seed the trainer with a dense in-object init cloud.
+        // pixels per keyframe to seed the trainer with a dense in-object init cloud; room mode
+        // also unprojects (no mask filter) at training-init time.
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             configuration.frameSemantics.insert(.smoothedSceneDepth)
         }
+        // Enable scene reconstruction (LiDAR mesh) for room mode. `frame.anchors` then carries
+        // `ARMeshAnchor`s whose vertices we walk into a world-space init cloud at training time —
+        // far better seed than the ~50-200 `rawFeaturePoints` sparse cloud alone. No-op on
+        // non-LiDAR devices, in which case room mode silently falls back to sparse features.
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            configuration.sceneReconstruction = .mesh
+        }
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         isRunning = true
+        startAutoCaptureLoop()
     }
 
     func stop() {
         guard isRunning else { return }
         session.pause()
         isRunning = false
+        autoCaptureTask?.cancel()
+        autoCaptureTask = nil
+    }
+
+    /// Polls the live ARKit pose at 10Hz and fires `captureKeyframe()` when the camera has
+    /// moved far enough or rotated enough from the last captured pose. Keeps the manual shutter
+    /// usable in parallel — both paths feed the same `keyframes` array and bump
+    /// `lastCapturedTransform`, so a manual tap resets the auto distance counter.
+    private func startAutoCaptureLoop() {
+        autoCaptureTask?.cancel()
+        autoCaptureTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard let self else { return }
+                await MainActor.run { self.tryAutoCapture() }
+            }
+        }
+    }
+
+    private func tryAutoCapture() {
+        guard isAutoCaptureEnabled,
+              isRunning,
+              keyframes.count < autoCaptureMaxKeyframes,
+              let frame = session.currentFrame else { return }
+        if let last = lastCaptureTime, Date().timeIntervalSince(last) < autoCaptureCooldown {
+            return
+        }
+        // ARKit can take a couple of frames before tracking stabilizes; ignore "not normal" so we
+        // don't seed the first keyframe with a bogus pose that mismatches everything that follows.
+        guard case .normal = frame.camera.trackingState else { return }
+        let xform = frame.camera.transform
+        let shouldCapture: Bool
+        if let prev = lastCapturedTransform {
+            let dt = simd_length(simd_make_float3(xform.columns.3) - simd_make_float3(prev.columns.3))
+            let dr = Self.relativeAngle(prev, xform)
+            shouldCapture = (dt >= autoCaptureTranslationThreshold) || (dr >= autoCaptureRotationThreshold)
+        } else {
+            // First keyframe — capture as soon as tracking is normal.
+            shouldCapture = true
+        }
+        if shouldCapture { captureKeyframe() }
+    }
+
+    /// Geodesic angle between the rotation parts of two camera-to-world transforms. Trace
+    /// formula on R_a^T * R_b; the diagonal of that product equals the per-column dot of the
+    /// rotation parts of `a` and `b`, so we can skip materialising the 3x3 entirely.
+    private static func relativeAngle(_ a: simd_float4x4, _ b: simd_float4x4) -> Float {
+        let d0 = simd_dot(simd_make_float3(a.columns.0), simd_make_float3(b.columns.0))
+        let d1 = simd_dot(simd_make_float3(a.columns.1), simd_make_float3(b.columns.1))
+        let d2 = simd_dot(simd_make_float3(a.columns.2), simd_make_float3(b.columns.2))
+        let trace = d0 + d1 + d2
+        return acos(max(-1, min(1, (trace - 1) * 0.5)))
     }
 
     /// Records the current frame as a keyframe. Returns false if no usable frame is available yet.
@@ -143,19 +226,137 @@ final class ARCaptureController: ObservableObject {
             }
         }
 
+        // Mark this pose so the auto-capture loop measures its next translation/rotation delta
+        // from here, whether this call came from a manual shutter tap or the auto loop itself.
+        lastCapturedTransform = frame.camera.transform
+        lastCaptureTime = Date()
+
         lastThumbnail = displayImage
         keyframeCount = keyframes.count
         return true
     }
 
-    /// Accumulated world-space points for trainer initialization.
+    /// Accumulated world-space sparse points for trainer initialization (rawFeaturePoints only).
+    /// Object mode adds masked LiDAR unprojection on top via `ObjectMaskProcessor`; room mode
+    /// uses `collectRoomInitCloud(voxelSize:)` to fold in the scene-mesh and dense-depth clouds.
     var collectedPoints: [simd_float3] { Array(featurePoints.values) }
+
+    /// Build a dense init point cloud for room-mode training by merging three sources:
+    ///   - ARKit `rawFeaturePoints` (sparse, every device; ~50-200 points)
+    ///   - `ARMeshAnchor` vertices, scene reconstruction (LiDAR; tens of thousands of points
+    ///     covering walls/floor/large furniture in world space)
+    ///   - Per-keyframe `smoothedSceneDepth` pixels with high confidence and 0.5-5m range
+    ///     (LiDAR; fills in small surfaces the mesh hasn't tessellated yet)
+    /// Voxelized onto a uniform grid so each cell contributes one init splat. With LiDAR
+    /// present, this returns ~20-50k well-placed seeds vs. ~200 from sparse alone — the single
+    /// biggest quality lever for the on-device room reconstruction.
+    func collectRoomInitCloud(voxelSize: Float = 0.02) -> (points: [simd_float3], source: String) {
+        var merged: [simd_float3] = Array(featurePoints.values)
+        var sources: [String] = []
+        if !featurePoints.isEmpty { sources.append("sparse") }
+
+        let meshPoints = meshVertexCloud()
+        if !meshPoints.isEmpty {
+            merged.append(contentsOf: meshPoints)
+            sources.append("mesh")
+        }
+
+        let depthPoints = depthCloud()
+        if !depthPoints.isEmpty {
+            merged.append(contentsOf: depthPoints)
+            sources.append("depth")
+        }
+
+        if merged.isEmpty { return ([], "empty") }
+        let voxelized = ObjectMaskProcessor.voxelize(merged, voxelSize: voxelSize)
+        return (voxelized, sources.joined(separator: "+"))
+    }
+
+    /// Walks every `ARMeshAnchor` currently attached to the session and emits each vertex in
+    /// world space (`anchor.transform * v`). Returns an empty array on non-LiDAR devices or
+    /// before scene reconstruction has produced any mesh.
+    private func meshVertexCloud() -> [simd_float3] {
+        guard let frame = session.currentFrame else { return [] }
+        let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        var out: [simd_float3] = []
+        for anchor in meshAnchors {
+            let geom = anchor.geometry
+            let vertices = geom.vertices
+            let count = vertices.count
+            let stride = vertices.stride
+            let offset = vertices.offset
+            let base = vertices.buffer.contents().advanced(by: offset)
+            let m = anchor.transform
+            out.reserveCapacity(out.count + count)
+            for i in 0..<count {
+                let raw = base.advanced(by: i * stride)
+                    .assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                // Apply the anchor's world transform. `m` is column-major simd_float4x4;
+                // the [0..2, 3] column is the translation.
+                let world = simd_make_float3(m * SIMD4<Float>(raw.x, raw.y, raw.z, 1))
+                out.append(world)
+            }
+        }
+        return out
+    }
+
+    /// Unprojects high-confidence depth pixels from each captured keyframe into world space,
+    /// using the keyframe's own intrinsics + camera-to-world pose. This is the room-mode
+    /// counterpart to `ObjectMaskProcessor.unproject`, minus the mask filter (we want every
+    /// surface pixel, not just the foreground).
+    private func depthCloud() -> [simd_float3] {
+        var out: [simd_float3] = []
+        for kf in keyframes {
+            guard let depth = kf.depth else { continue }
+            out.append(contentsOf: Self.unprojectDepth(depth: depth, keyframe: kf))
+        }
+        return out
+    }
+
+    /// Pinhole unprojection in ARKit/OpenGL camera convention (image y-down → camera y-up).
+    /// Same math as `ObjectMaskProcessor.unproject`; kept inline to avoid leaking another helper
+    /// out of the object-mode module.
+    private static func unprojectDepth(depth: DepthSnapshot, keyframe: CaptureKeyframe) -> [simd_float3] {
+        // Depth map is lower-res than the JPEG; sample with a half-pixel offset to land on the
+        // matching image-space coordinate, then apply pinhole intrinsics in image-pixel space.
+        let imgW = Float(keyframe.width)
+        let imgH = Float(keyframe.height)
+        let fx = keyframe.fx, fy = keyframe.fy
+        let cx = keyframe.cx, cy = keyframe.cy
+        // Camera-to-world is row-major; pull the 12 active entries inline. Last row is (0,0,0,1).
+        let m = keyframe.transformRowMajor
+        var points: [simd_float3] = []
+        points.reserveCapacity(depth.width * depth.height / 8)
+        for dv in 0..<depth.height {
+            let rowBase = dv * depth.width
+            for du in 0..<depth.width {
+                let d = depth.values[rowBase + du]
+                // High confidence only (==2). LiDAR is reliable in 0.5–5m; anything outside is
+                // noise that drives the trainer away from the right geometry.
+                if depth.confidence[rowBase + du] < 2 { continue }
+                if d < 0.5 || d > 5.0 { continue }
+                let u = (Float(du) + 0.5) * imgW / Float(depth.width)
+                let v = (Float(dv) + 0.5) * imgH / Float(depth.height)
+                let cX = (u - cx) * d / fx
+                let cY = -(v - cy) * d / fy
+                let cZ: Float = -d
+                points.append(simd_float3(
+                    m[0]  * cX + m[1]  * cY + m[2]  * cZ + m[3],
+                    m[4]  * cX + m[5]  * cY + m[6]  * cZ + m[7],
+                    m[8]  * cX + m[9]  * cY + m[10] * cZ + m[11]
+                ))
+            }
+        }
+        return points
+    }
 
     func reset() {
         keyframes.removeAll()
         featurePoints.removeAll()
         lastThumbnail = nil
         keyframeCount = 0
+        lastCapturedTransform = nil
+        lastCaptureTime = nil
     }
 
     /// simd stores matrices column-major; emit true row-major M[r][c] = columns[c][r].
