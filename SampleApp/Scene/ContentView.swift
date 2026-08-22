@@ -66,6 +66,22 @@ struct ContentView: View {
 #endif // os(iOS)
     }
 
+    /// Bench mode. `BENCH_PLY` names a file in Documents to open on launch and
+    /// `BENCH_RELIGHT` presets the relighting toggle, so a frame-time sweep can
+    /// be driven from the command line rather than by tapping through the UI —
+    /// which is the only way the numbers stay comparable between runs.
+    private func openBenchModelIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard let name = environment["BENCH_PLY"] else { return }
+#if os(iOS)
+        if let relight = environment["BENCH_RELIGHT"] {
+            relightControls.isEnabled = relight != "0"
+        }
+#endif
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        openWindow(value: .gaussianSplat(documents.appendingPathComponent(name)))
+    }
+
     @ViewBuilder
     var mainView: some View {
         VStack {
@@ -153,5 +169,6 @@ struct ContentView: View {
             Spacer()
 #endif // os(visionOS)
         }
+        .onAppear { openBenchModelIfRequested() }
     }
 }

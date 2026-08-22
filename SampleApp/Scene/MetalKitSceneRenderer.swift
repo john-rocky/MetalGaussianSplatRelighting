@@ -76,6 +76,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     /// `arActive` mirrors draw()'s AR state so the gesture handlers target the model, not the orbit camera.
     private var arActive = false
     private var arModelYaw: Angle = .zero
+    private var arModelPitch: Angle = .zero   // vertical-drag tilt, to stand up a sideways-loaded splat
+    // Normalized model AABB (base at y=0), used to re-ground the model on the floor after the user
+    // rotates it, so tilting it upright never sinks it through the floor.
+    private var arModelAABBMin = SIMD3<Float>(-0.5, 0, -0.5)
+    private var arModelAABBMax = SIMD3<Float>(0.5, 1, 0.5)
     /// Real-world size of the model in meters (its longest footprint dimension). Default ≈ a car length.
     private var arModelLengthMeters: Float = 4.5
     private var pinchReferenceLength: Float = 4.5
@@ -110,6 +115,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var cameraDistance: Float = Constants.cameraInitialDistance
     var userHasInteracted = false
 
+    /// User-adjustable tilt added to the fixed up-calibration (about the model's X axis). Lets a
+    /// two-finger rotation gesture stand up a model whose up-axis convention differs from this
+    /// viewer's (e.g. TripoSplat splats load on their side until twisted upright).
+    var modelTiltAdjust: Angle = .zero
+
     /// Zoom target snapshotted at pinch start (orbit distance), so the cumulative gesture scale maps
     /// relative to it. The AR model-scale reference is `pinchReferenceScale`.
     private var pinchReferenceDistance: Float = Constants.cameraInitialDistance
@@ -121,9 +131,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     func orbitBy(dx: Float, dy: Float) {
 #if os(iOS)
         if arActive {
-            // Grounded car: horizontal drag spins it on the floor (yaw); vertical drag is ignored so
-            // it can't tilt into/through the ground.
+            // Horizontal drag yaws; vertical drag tilts (pitch). The model is auto-re-grounded each
+            // frame (rotatedMinY), so tilting a sideways splat upright never sinks it through the floor.
+            // Two-finger twist adds roll (modelTiltAdjust).
             arModelYaw += Angle(radians: Double(dx * Constants.cameraOrbitRadiansPerPoint))
+            arModelPitch += Angle(radians: Double(dy * Constants.cameraOrbitRadiansPerPoint))
             return
         }
 #endif
@@ -154,6 +166,13 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 #endif
         userHasInteracted = true
         cameraDistance = min(max(pinchReferenceDistance / max(scale, 0.0001), Constants.cameraMinDistance), Constants.cameraMaxDistance)
+    }
+
+    /// Two-finger rotation: adjust the model's up-tilt (about its X axis) so the user can stand a
+    /// sideways-loaded splat upright. `delta` is the incremental gesture rotation in radians.
+    func tiltBy(radians delta: Float) {
+        userHasInteracted = true
+        modelTiltAdjust += Angle(radians: Double(delta))
     }
 
     /// Places (or moves) the model onto the floor under a normalized screen point (0...1, top-left).
@@ -201,6 +220,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             let placement = Self.modelPlacement(for: Self.robustModelBounds(points))
             arModelNormalize = placement.normalize
             arModelFootprint = placement.footprint
+            arModelAABBMin = placement.aabbMin
+            arModelAABBMax = placement.aabbMax
 #endif
             let chunk = try SplatChunk(device: device, from: points)
             await splat.addChunk(chunk)
@@ -249,11 +270,15 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         // which otherwise renders them rolled 90° onto their side. Map data +Z -> viewer +Y.
         let upCalibration = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
 
+        // Two-finger twist pitches the model about the screen's horizontal axis (eye-space X), so a
+        // splat lying flat (up-axis toward the camera) can be tipped upright. Applied leftmost = eye space.
+        let screenRoll = matrix4x4_rotation(radians: Float(modelTiltAdjust.radians), axis: SIMD3<Float>(1, 0, 0))
+
         let viewport = MTLViewport(originX: 0, originY: 0, width: drawableSize.width, height: drawableSize.height, znear: 0, zfar: 1)
 
         return ModelRendererViewportDescriptor(viewport: viewport,
                                                projectionMatrix: projectionMatrix,
-                                               viewMatrix: translationMatrix * pitchMatrix * yawMatrix * upCalibration,
+                                               viewMatrix: screenRoll * translationMatrix * pitchMatrix * yawMatrix * upCalibration,
                                                screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
     }
 
@@ -335,6 +360,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let semaphore = inFlightSemaphore
         commandBuffer.addCompletedHandler { (_ commandBuffer)-> Swift.Void in
             semaphore.signal()
+            FrameProbe.shared.record(commandBuffer)
         }
 
         updateRotation()
@@ -344,6 +370,16 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         ensureHDRTexture(width: drawableTexture.width, height: drawableTexture.height)
 
         let splat = modelRenderer as? SplatRenderer
+
+        FrameProbe.shared.configure(
+            splats: splat?.splatCount ?? 0,
+            // The renderer's own value, not the control's: relighting only
+            // actually runs once the IBL environment has finished building, so
+            // the control alone would report work that is not happening yet.
+            relight: splat?.relightSettings.isEnabled ?? false,
+            environment: relightControls.map { String(describing: $0.environmentChoice) } ?? "none",
+            width: drawableTexture.width,
+            height: drawableTexture.height)
 
         // Full AR: when "AR / Room" is selected and a tracked camera frame is available, drive the
         // camera from ARKit (view/projection from ARCamera, model anchored in the world) and convert
@@ -476,6 +512,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         arProbeProvider?.stop()
         arFloorPosition = nil
         arModelYaw = .zero
+        arModelPitch = .zero
+        modelTiltAdjust = .zero
         arModelLengthMeters = 4.5
         lastTurntableTimestamp = nil
         arActive = false
@@ -542,7 +580,12 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         // real meters, and spin it by the user's yaw. arModelNormalize already maps Z-up->Y-up.
         let floorAnchor = matrix4x4_translation(floor.x, floor.y, floor.z)
         let yaw = matrix4x4_rotation(radians: Float(arModelYaw.radians), axis: SIMD3<Float>(0, 1, 0))
-        let modelWorld = floorAnchor * yaw * matrix4x4_scale(arModelLengthMeters) * arModelNormalize
+        let pitch = matrix4x4_rotation(radians: Float(arModelPitch.radians), axis: SIMD3<Float>(1, 0, 0))
+        let roll = matrix4x4_rotation(radians: Float(modelTiltAdjust.radians), axis: SIMD3<Float>(0, 0, 1))
+        let orient = pitch * roll
+        // Drop the oriented model so its rotated AABB bottom rests on the floor (no sink-through).
+        let reGround = matrix4x4_translation(0, -Self.rotatedMinY(orient, arModelAABBMin, arModelAABBMax), 0)
+        let modelWorld = floorAnchor * yaw * matrix4x4_scale(arModelLengthMeters) * reGround * orient * arModelNormalize
         let viewMatrix = viewWorld * modelWorld
 
         let mtlViewport = MTLViewport(originX: 0, originY: 0,
@@ -629,7 +672,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     /// longest footprint dimension = 1 unit, so `arModelLengthMeters` reads as meters) plus the
     /// normalized footprint extents (world XZ) used to size the contact shadow.
     private static func modelPlacement(for bounds: (min: SIMD3<Float>, max: SIMD3<Float>))
-        -> (normalize: matrix_float4x4, footprint: SIMD2<Float>) {
+        -> (normalize: matrix_float4x4, footprint: SIMD2<Float>, aabbMin: SIMD3<Float>, aabbMax: SIMD3<Float>) {
         let r = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))   // Z-up -> Y-up
         // AABB after r maps model (x,y,z) -> world' (x, z, -y).
         let mn = bounds.min, mx = bounds.max
@@ -637,12 +680,29 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let yMin = mn.z, yMax = mx.z        // world' y (= model z)
         let zMin = -mx.y, zMax = -mn.y      // world' z (= -model y)
         let extX = xMax - xMin
+        let extY = yMax - yMin
         let extZ = zMax - zMin
         let horizontal = max(extX, extZ)
         let normScale = horizontal > 1e-5 ? 1.0 / horizontal : 1.0
         let translate = matrix4x4_translation(-(xMin + xMax) * 0.5, -yMin, -(zMin + zMax) * 0.5)
         let normalize = matrix4x4_scale(normScale) * translate * r
-        return (normalize, SIMD2<Float>(extX * normScale, extZ * normScale))
+        // Normalized AABB: centered in x/z, base at y=0, used to re-ground after user rotation.
+        let aabbMin = SIMD3<Float>(-extX * normScale * 0.5, 0, -extZ * normScale * 0.5)
+        let aabbMax = SIMD3<Float>(extX * normScale * 0.5, extY * normScale, extZ * normScale * 0.5)
+        return (normalize, SIMD2<Float>(extX * normScale, extZ * normScale), aabbMin, aabbMax)
+    }
+
+    /// Lowest y of an AABB after applying a rotation — used to drop the rotated model onto the floor.
+    private static func rotatedMinY(_ m: matrix_float4x4, _ mn: SIMD3<Float>, _ mx: SIMD3<Float>) -> Float {
+        var minY = Float.greatestFiniteMagnitude
+        for x in [mn.x, mx.x] {
+            for y in [mn.y, mx.y] {
+                for z in [mn.z, mx.z] {
+                    minY = min(minY, (m * SIMD4<Float>(x, y, z, 1)).y)
+                }
+            }
+        }
+        return minY
     }
 
     private func currentInterfaceOrientation() -> UIInterfaceOrientation {
@@ -1126,5 +1186,76 @@ private struct SendableTexture: @unchecked Sendable {
 }
 
 #endif // os(iOS)
+
+/// Frame timing for the renderer, reported to the console.
+///
+/// The README calls this renderer real-time without ever saying at what. GPU
+/// time comes from the command buffer's own clock rather than a wall-clock
+/// difference, so it measures the work rather than how often the display asked
+/// for it — a frame that finishes in 4 ms still presents at the 8.3 ms the
+/// 120 Hz display allows, and only the first number says whether there is
+/// headroom left.
+final class FrameProbe: @unchecked Sendable {
+    static let shared = FrameProbe()
+
+    /// Frames per report. Two seconds or so at 60 Hz, long enough to average
+    /// out a stray hitch and short enough to catch a change in the scene.
+    private let window = 120
+
+    private let lock = NSLock()
+    private var gpuSeconds: [Double] = []
+    private var cpuSeconds: [Double] = []
+    private var lastPresented: CFTimeInterval?
+    private var label = ""
+
+    /// Describe what is being rendered. Changing this flushes the current
+    /// window, so a report never straddles two configurations.
+    func configure(splats: Int, relight: Bool, environment: String, width: Int, height: Int) {
+        let next = "splats=\(splats) relight=\(relight ? 1 : 0) env=\(environment) " +
+                   "size=\(width)x\(height)"
+        lock.lock()
+        defer { lock.unlock() }
+        guard next != label else { return }
+        label = next
+        gpuSeconds.removeAll(keepingCapacity: true)
+        cpuSeconds.removeAll(keepingCapacity: true)
+        lastPresented = nil
+    }
+
+    func record(_ commandBuffer: MTLCommandBuffer) {
+        let gpu = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+        guard gpu > 0 else { return }   // zero until the buffer has actually run
+        let now = CACurrentMediaTime()
+
+        lock.lock()
+        var report: String?
+        gpuSeconds.append(gpu)
+        if let last = lastPresented { cpuSeconds.append(now - last) }
+        lastPresented = now
+        if gpuSeconds.count >= window {
+            report = summary()
+            gpuSeconds.removeAll(keepingCapacity: true)
+            cpuSeconds.removeAll(keepingCapacity: true)
+        }
+        lock.unlock()
+
+        if let report { print(report) }
+    }
+
+    /// Caller holds the lock.
+    private func summary() -> String {
+        let gpu = gpuSeconds.sorted()
+        let frame = cpuSeconds.sorted()
+        func ms(_ xs: [Double], _ q: Double) -> Double {
+            guard !xs.isEmpty else { return 0 }
+            return xs[min(xs.count - 1, Int(q * Double(xs.count)))] * 1000
+        }
+        let interval = ms(frame, 0.5)
+        return String(
+            format: "RENDERPERF %@ gpu_ms=%.2f gpu_p95_ms=%.2f frame_ms=%.2f fps=%.1f n=%d",
+            label, ms(gpu, 0.5), ms(gpu, 0.95), interval,
+            interval > 0 ? 1000 / interval : 0, gpu.count)
+    }
+}
 
 #endif // os(iOS) || os(macOS)
