@@ -54,6 +54,7 @@ struct ContentView: View {
                     } else {
                         MetalKitSceneView(modelIdentifier: modelIdentifier, relightControls: relightControls)
                             .navigationTitle(modelIdentifier.description)
+                            .overlay(alignment: .top) { FrameReadoutView() }
                             .overlay(alignment: .bottom) {
                                 if case .gaussianSplat = modelIdentifier {
                                     RelightControlsView(controls: relightControls)
@@ -172,3 +173,19 @@ struct ContentView: View {
         .onAppear { openBenchModelIfRequested() }
     }
 }
+
+#if os(iOS)
+/// Frame timing drawn over the scene, so a screen recording is self-evidencing.
+struct FrameReadoutView: View {
+    @State private var readout = FrameProbe.readout
+
+    var body: some View {
+        Text(readout.line.isEmpty ? "measuring…" : readout.line)
+            .font(.caption.monospacedDigit())
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.top, 4)
+    }
+}
+#endif

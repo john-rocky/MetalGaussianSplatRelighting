@@ -1198,14 +1198,29 @@ private struct SendableTexture: @unchecked Sendable {
 final class FrameProbe: @unchecked Sendable {
     static let shared = FrameProbe()
 
+    /// What the on-screen overlay shows, so a screen recording carries its own
+    /// evidence rather than needing the console alongside it.
+    @MainActor
+    @Observable
+    final class Readout {
+        var line = ""
+    }
+
+    @MainActor static let readout = Readout()
+
     /// Frames per report. Two seconds or so at 60 Hz, long enough to average
     /// out a stray hitch and short enough to catch a change in the scene.
     private let window = 120
+    /// The overlay updates far more often than the console does; a quarter of a
+    /// second is slow enough to read and fast enough to follow a moving camera.
+    private let overlayWindow = 15
 
     private let lock = NSLock()
     private var gpuSeconds: [Double] = []
     private var cpuSeconds: [Double] = []
     private var lastPresented: CFTimeInterval?
+    private var recent: [Double] = []
+    private var recentIntervals: [CFTimeInterval] = []
     private var label = ""
 
     /// Describe what is being rendered. Changing this flushes the current
@@ -1219,6 +1234,8 @@ final class FrameProbe: @unchecked Sendable {
         label = next
         gpuSeconds.removeAll(keepingCapacity: true)
         cpuSeconds.removeAll(keepingCapacity: true)
+        recent.removeAll(keepingCapacity: true)
+        recentIntervals.removeAll(keepingCapacity: true)
         lastPresented = nil
     }
 
@@ -1229,9 +1246,17 @@ final class FrameProbe: @unchecked Sendable {
 
         lock.lock()
         var report: String?
+        var overlay: String?
         gpuSeconds.append(gpu)
         if let last = lastPresented { cpuSeconds.append(now - last) }
         lastPresented = now
+        recent.append(gpu)
+        recentIntervals.append(now)
+        if recent.count >= overlayWindow {
+            overlay = overlayLine()
+            recent.removeAll(keepingCapacity: true)
+            recentIntervals.removeAll(keepingCapacity: true)
+        }
         if gpuSeconds.count >= window {
             report = summary()
             gpuSeconds.removeAll(keepingCapacity: true)
@@ -1240,6 +1265,20 @@ final class FrameProbe: @unchecked Sendable {
         lock.unlock()
 
         if let report { print(report) }
+        if let overlay {
+            Task { @MainActor in Self.readout.line = overlay }
+        }
+    }
+
+    /// Caller holds the lock.
+    private func overlayLine() -> String {
+        let gpu = recent.sorted()
+        let median = gpu[gpu.count / 2] * 1000
+        var fps = 0.0
+        if let first = recentIntervals.first, let last = recentIntervals.last, last > first {
+            fps = Double(recentIntervals.count - 1) / (last - first)
+        }
+        return String(format: "%@  ·  %.1f ms GPU  ·  %.0f fps", label, median, fps)
     }
 
     /// Caller holds the lock.
