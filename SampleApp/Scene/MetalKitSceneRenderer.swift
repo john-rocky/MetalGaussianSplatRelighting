@@ -120,6 +120,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     /// viewer's (e.g. TripoSplat splats load on their side until twisted upright).
     var modelTiltAdjust: Angle = .zero
 
+    /// Model-to-viewer up-axis calibration, chosen per file at load time. Blender / Ref-NeRF
+    /// style .ply datasets are Z-up and need the -90° X rotation; Scaniverse .spz scenes are
+    /// already Y-up and load rolled onto their side if the rotation is applied anyway.
+    var upAxisCalibration = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+
     /// Zoom target snapshotted at pinch start (orbit distance), so the cumulative gesture scale maps
     /// relative to it. The AR model-scale reference is `pinchReferenceScale`.
     private var pinchReferenceDistance: Float = Constants.cameraInitialDistance
@@ -212,6 +217,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                           sampleCount: metalKitView.sampleCount,
                                           maxViewCount: 1,
                                           maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+            // Scaniverse .spz scenes carry Y pointing down (identity leaves them upside-down,
+            // verified on-device); the 180° X rotation stands them upright.
+            upAxisCalibration = url.pathExtension.lowercased() == "spz"
+                ? matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(1, 0, 0))
+                : matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
             let reader = try AutodetectSceneReader(url)
             let points = try await reader.readAll()
 #if os(iOS)
@@ -266,9 +276,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let pitchMatrix = matrix4x4_rotation(radians: Float(cameraPitch.radians), axis: SIMD3<Float>(1, 0, 0))
         let translationMatrix = matrix4x4_translation(0.0, 0.0, -cameraDistance)
 
-        // Ref-NeRF / Blender datasets (helmet, car, ...) are Z-up, but this viewer's camera is Y-up,
-        // which otherwise renders them rolled 90° onto their side. Map data +Z -> viewer +Y.
-        let upCalibration = matrix4x4_rotation(radians: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+        // Up-axis calibration is chosen per file at load time (Z-up .ply vs Y-up .spz).
+        let upCalibration = upAxisCalibration
 
         // Two-finger twist pitches the model about the screen's horizontal axis (eye-space X), so a
         // splat lying flat (up-axis toward the camera) can be tipped upright. Applied leftmost = eye space.
