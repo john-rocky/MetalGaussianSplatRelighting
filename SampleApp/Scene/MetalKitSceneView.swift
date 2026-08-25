@@ -37,6 +37,11 @@ struct MetalKitSceneView: ViewRepresentable {
             let p = g.location(in: view)
             renderer?.placeAt(normalizedPoint: CGPoint(x: p.x / view.bounds.width, y: p.y / view.bounds.height))
         }
+        // Two-finger twist: stand a sideways-loaded splat upright (adjusts the model up-tilt).
+        @objc func handleRotation(_ g: UIRotationGestureRecognizer) {
+            renderer?.tiltBy(radians: Float(g.rotation))
+            g.rotation = 0
+        }
 #elseif os(macOS)
         @objc func handlePan(_ g: NSPanGestureRecognizer) {
             let t = g.translation(in: g.view)
@@ -74,6 +79,14 @@ struct MetalKitSceneView: ViewRepresentable {
             metalKitView.device = metalDevice
         }
 
+        // MTKView caps at 60 by default, and inside that cap the GPU clocks down
+        // to just meet it — so a frame that could finish in 3 ms reports 15 ms
+        // and every scene under the cap looks identical. BENCH_FPS raises the
+        // ceiling so a measurement sees the work rather than the power policy.
+        if let fps = ProcessInfo.processInfo.environment["BENCH_FPS"], let n = Int(fps) {
+            metalKitView.preferredFramesPerSecond = n
+        }
+
         let renderer = MetalKitSceneRenderer(metalKitView)
         renderer?.relightControls = relightControls
         coordinator.renderer = renderer
@@ -82,7 +95,13 @@ struct MetalKitSceneView: ViewRepresentable {
         // Interactive orbit camera: drag to rotate, pinch to zoom.
 #if os(iOS)
         metalKitView.addGestureRecognizer(UIPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePan(_:))))
-        metalKitView.addGestureRecognizer(UIPinchGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePinch(_:))))
+        let pinch = UIPinchGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePinch(_:)))
+        pinch.delegate = coordinator
+        metalKitView.addGestureRecognizer(pinch)
+        // Two-finger twist to stand the model upright; recognized simultaneously with pinch-zoom.
+        let rotate = UIRotationGestureRecognizer(target: coordinator, action: #selector(Coordinator.handleRotation(_:)))
+        rotate.delegate = coordinator
+        metalKitView.addGestureRecognizer(rotate)
         metalKitView.addGestureRecognizer(UITapGestureRecognizer(target: coordinator, action: #selector(Coordinator.handleTap(_:))))
 #elseif os(macOS)
         metalKitView.addGestureRecognizer(NSPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.handlePan(_:))))
@@ -122,5 +141,13 @@ struct MetalKitSceneView: ViewRepresentable {
         }
     }
 }
+
+#if os(iOS)
+extension MetalKitSceneView.Coordinator: UIGestureRecognizerDelegate {
+    // Let pinch-zoom and the two-finger twist run at the same time.
+    func gestureRecognizer(_ g: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+}
+#endif
 
 #endif // os(iOS) || os(macOS)
